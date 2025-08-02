@@ -1,0 +1,66 @@
+[
+  {
+    "name": "Red Rose Bouquet",
+    "id": "RRB001",
+    "description": "Classic dozen red roses arranged with baby's breath and greenery. Perfect for romantic occasions.",
+    "type": "bouquet",
+    "price": 45.99,
+    "quantity": 15
+  },
+  {
+    "name": "Mixed Spring Arrangement",
+    "id": "MSA002", 
+    "description": "Colorful spring mix with tulips, daffodils, and hyacinths in a ceramic vase.",
+    "type": "arrangement",
+    "price": 38.50,
+    "quantity": 8
+  },
+  {
+    "name": "White Lily Sympathy Bouquet",
+    "id": "WLS003",
+    "description": "Elegant white lilies with eucalyptus, appropriate for sympathy and remembrance.",
+    "type": "sympathy",
+    "price": 52.00,
+    "quantity": 6
+  },
+  {
+    "name": "Sunflower Happiness Bunch",
+    "id": "SHB004",
+    "description": "Bright sunflowers with orange gerbera daisies to bring sunshine to any day.",
+    "type": "bouquet", 
+    "price": 32.99,
+    "quantity": 12
+  },
+  {
+    "name": "Purple Orchid Plant",
+    "id": "POP005",
+    "description": "Beautiful purple phalaenopsis orchid in decorative pot, long-lasting and elegant.",
+    "type": "plant",
+    "price": 65.00,
+    "quantity": 4
+  },
+  {
+    "name": "Birthday Celebration Mix",
+    "id": "BCM006",
+    "description": "Vibrant mix of roses, carnations, and alstroemeria in bright, cheerful colors.",
+    "type": "celebration",
+    "price": 41.25,
+    "quantity": 10
+  },
+  {
+    "name": "Pink Peony Seasonal Special",
+    "id": "PPS007",
+    "description": "Gorgeous pink peonies available during season (May-June), absolutely stunning.",
+    "type": "seasonal",
+    "price": 58.75,
+    "quantity": 3
+  },
+  {
+    "name": "Small Succulent Garden",
+    "id": "SSG008",
+    "description": "Assorted small succulents arranged in a modern geometric planter.",
+    "type": "plant",
+    "price": 24.99,
+    "quantity": 20
+  }
+]

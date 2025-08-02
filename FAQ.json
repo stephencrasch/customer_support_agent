@@ -1,0 +1,34 @@
+[
+  {
+    "question": "What are your store hours?",
+    "answer": "We're open Monday through Saturday from 9 AM to 7 PM, and Sunday from 10 AM to 5 PM."
+  },
+  {
+    "question": "Do you offer same-day delivery?",
+    "answer": "Yes! We offer same-day delivery for orders placed before 2 PM within our delivery area. There's a $15 delivery fee for same-day service."
+  },
+  {
+    "question": "What types of flowers do you have available?",
+    "answer": "We carry a wide variety of fresh flowers including roses, tulips, lilies, carnations, sunflowers, orchids, and seasonal blooms. Our inventory changes based on availability and season."
+  },
+  {
+    "question": "Do you do wedding arrangements?",
+    "answer": "Absolutely! We specialize in wedding florals including bridal bouquets, boutonnieres, centerpieces, and ceremony decorations. We recommend booking at least 4-6 weeks in advance."
+  },
+  {
+    "question": "Can I pre-order flowers for special occasions?",
+    "answer": "Yes, we encourage pre-orders especially for holidays like Valentine's Day, Mother's Day, and other busy periods. This ensures availability and allows us to prepare your perfect arrangement."
+  },
+  {
+    "question": "What payment methods do you accept?",
+    "answer": "We accept cash, all major credit cards (Visa, MasterCard, American Express), debit cards, and mobile payments like Apple Pay and Google Pay."
+  },
+  {
+    "question": "Do you offer flower care tips?",
+    "answer": "Yes! Always trim stems at an angle under running water, change water every 2-3 days, remove wilted leaves, and keep flowers away from direct sunlight and heat sources."
+  },
+  {
+    "question": "Can you help with corporate events?",
+    "answer": "Certainly! We provide floral arrangements for corporate events, office spaces, grand openings, and business celebrations. Contact us for volume pricing and custom arrangements."
+  }
+]

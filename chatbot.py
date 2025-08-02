@@ -6,7 +6,15 @@ from tools import query_knowledge_base, search_for_product_recommendations, quer
 from dotenv import load_dotenv
 import os
 
+# Load environment variables
 load_dotenv()
+
+# Production readiness check
+if not os.environ.get('OPENAI_API_KEY'):
+    raise ValueError(
+        "OPENAI_API_KEY not found in environment variables. "
+        "Please set your OpenAI API key in a .env file or environment variable."
+    )
 
 prompt = """#Purpose
 You are a customer service chatbot for a flower shop company. You can help the customer achieve the goals listed below.
