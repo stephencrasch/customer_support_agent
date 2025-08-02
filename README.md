@@ -4,12 +4,19 @@ A simple customer support chatbot for a flower shop, built with Streamlit and La
 
 ## Quick Start for Beginners
 
-### 1. Install Dependencies
+### Option 1: One-Command Setup (Easiest)
+```bash
+# This script will check dependencies and guide you through setup
+./run.sh
+```
+
+### Option 2: Manual Setup
+#### 1. Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Set Up Environment
+#### 2. Set Up Environment
 ```bash
 # Copy the example environment file
 cp .env.example .env
@@ -18,12 +25,12 @@ cp .env.example .env
 # Get your API key from: https://platform.openai.com/account/api-keys
 ```
 
-### 3. Run the Simple Version (Recommended for Beginners)
+#### 3. Run the Simple Version (Recommended for Beginners)
 ```bash
 streamlit run simple_streamlit.py
 ```
 
-### 4. Run the Full Version (Advanced Features)
+#### 4. Run the Full Version (Advanced Features)
 ```bash
 streamlit run streamlit_frontend.py
 ```
