@@ -33,38 +33,59 @@ def get_db_connection():
 
 def init_database() -> None:
     """Initialize the database tables with proper schema."""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        # SQLite uses INTEGER PRIMARY KEY AUTOINCREMENT, not SERIAL
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS conversation_summaries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                summary TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        conn.commit()
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            # SQLite uses INTEGER PRIMARY KEY AUTOINCREMENT, not SERIAL
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS conversation_summaries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    summary TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()
+            logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+        raise
 
 def save_summary_to_db(summary: str):
     """Save a summary to the database using the context manager."""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        # SQLite uses ? placeholders, not %s
-        cursor.execute(
-            "INSERT INTO conversation_summaries (summary) VALUES (?)",
-            (summary,)
-        )
-        conn.commit()
+    try:
+        # Ensure database is initialized before saving
+        init_database()
+        
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            # SQLite uses ? placeholders, not %s
+            cursor.execute(
+                "INSERT INTO conversation_summaries (summary) VALUES (?)",
+                (summary,)
+            )
+            conn.commit()
+            logger.info(f"Summary saved to database: {summary[:50]}...")
+    except Exception as e:
+        logger.error(f"Failed to save summary: {e}")
+        raise
 
 def search_summaries_in_db(query: str):
     """Search for summaries in the database."""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        # SQLite uses LIKE instead of ILIKE (case-insensitive search)
-        # Use LOWER() for case-insensitive matching
-        cursor.execute(
-            "SELECT summary FROM conversation_summaries WHERE LOWER(summary) LIKE LOWER(?) ORDER BY created_at DESC LIMIT 5",
-            (f"%{query}%",)
-        )
-        results = cursor.fetchall()
-        return [row['summary'] for row in results]
+    try:
+        # Ensure database is initialized before searching
+        init_database()
+        
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            # SQLite uses LIKE instead of ILIKE (case-insensitive search)
+            # Use LOWER() for case-insensitive matching
+            cursor.execute(
+                "SELECT summary FROM conversation_summaries WHERE LOWER(summary) LIKE LOWER(?) ORDER BY created_at DESC LIMIT 5",
+                (f"%{query}%",)
+            )
+            results = cursor.fetchall()
+            logger.info(f"Found {len(results)} matching summaries for query: {query}")
+            return [row['summary'] for row in results]
+    except Exception as e:
+        logger.error(f"Failed to search summaries: {e}")
+        return []
