@@ -3,8 +3,8 @@
 Goal: a tiny, reliable loop for testing LangGraph turn-by-turn.
 
 How it works:
-- We keep a fixed `thread_id` so the MemorySaver checkpointer can persist state
-  across turns.
+- We reuse the same `thread_id` across runs (saved in `.tutor_thread_id`) so the
+  checkpointer and JSON store keep long-term continuity.
 - Each user input is passed in as `student_answer`.
 - The graph runs router -> chat -> END.
 - We print only the *new* AI messages since the last turn.
@@ -15,9 +15,16 @@ Exit commands:
 
 from __future__ import annotations
 
+import os
 import uuid
 
+# Disable remote tracing for local CLI test sessions to avoid noisy network errors.
+os.environ["LANGCHAIN_TRACING_V2"] = "false"
+os.environ["LANGSMITH_TRACING"] = "false"
+
 from tutor_agent import app
+
+THREAD_ID_FILE = os.path.join(os.path.dirname(__file__), ".tutor_thread_id")
 
 
 def _new_ai_messages(state: dict, *, cursor: int) -> tuple[list[str], int]:
@@ -39,13 +46,35 @@ def _new_ai_messages(state: dict, *, cursor: int) -> tuple[list[str], int]:
     return out, len(messages)
 
 
+def _load_or_create_thread_id() -> str:
+    override = (os.getenv("TUTOR_THREAD_ID") or "").strip()
+    if override:
+        return override
+
+    try:
+        with open(THREAD_ID_FILE, "r", encoding="utf-8") as f:
+            existing = f.read().strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+
+    thread_id = f"tutor_{uuid.uuid4().hex[:8]}"
+    try:
+        with open(THREAD_ID_FILE, "w", encoding="utf-8") as f:
+            f.write(thread_id + "\n")
+    except OSError:
+        pass
+    return thread_id
+
+
 def main() -> None:
     print("=" * 70)
     print("🎓 Tutor Agent (LangGraph) - Interactive Chat")
     print("=" * 70)
 
     # Thread id is what the checkpointer uses to load/save state.
-    thread_id = f"tutor_{uuid.uuid4().hex[:8]}"
+    thread_id = _load_or_create_thread_id()
     config = {"configurable": {"thread_id": thread_id}}
 
     print("\n✅ Session started")

@@ -6,6 +6,7 @@
 # Local app data / generated artifacts
 .knowledge_graphs/
 student_store.json
+.tutor_thread_id
 
 # Python
 __pycache__/
