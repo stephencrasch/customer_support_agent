@@ -44,6 +44,8 @@ class TutorState(TypedDict):
     tutor_hint: str
     concept_updates: List[Dict[str, Any]]
     review_result: Dict[str, Any]
+    planned_review_target: Dict[str, Any]
+    planned_goal_concept: str
     next: str
     action_reason: str
 
@@ -63,6 +65,10 @@ def _utc_now_iso() -> str:
 
 def _norm_text(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
+
+
+def _norm_alnum(s: str) -> str:
+    return "".join(ch.lower() for ch in (s or "") if ch.isalnum())
 
 
 def _to_concept_id(s: str) -> str:
@@ -203,6 +209,172 @@ def _quality_from_delta(delta: float) -> int:
     return 1
 
 
+def _minimum_score_from_overlap(*, label: str, question: str, answer: str) -> int:
+    lowered = _norm_text(answer)
+    if not lowered:
+        return 0
+
+    tokens: List[str] = []
+    for raw in (label, question):
+        for token in _norm_text(raw).split():
+            if len(token) >= 4 and token not in {"quick", "check", "before", "about", "neural", "networks"}:
+                tokens.append(token)
+    unique_tokens = list(dict.fromkeys(tokens))
+    if not unique_tokens:
+        return 0
+
+    matches = sum(1 for token in unique_tokens if token in lowered)
+    if matches <= 0:
+        return 0
+    if matches == 1:
+        return 30
+    if matches == 2:
+        return 45
+    return 60
+
+
+PREREQUISITE_CATALOG: Dict[str, Dict[str, Any]] = {
+    "self_attention": {
+        "aliases": [
+            "self attention",
+            "self-attention",
+            "attention mechanism",
+            "transformer attention",
+        ],
+        "prerequisites": [
+            {
+                "concept_id": "vectors_and_matrices",
+                "label": "Vectors and Matrices",
+                "question": "Quick check before self-attention: what is a vector, and how is a matrix used in neural networks?",
+            },
+            {
+                "concept_id": "dot_product",
+                "label": "Dot Product",
+                "question": "Quick check: what does a dot product tell us about two vectors?",
+            },
+            {
+                "concept_id": "softmax",
+                "label": "Softmax",
+                "question": "Quick check: what does softmax do, and why is it useful in attention?",
+            },
+        ],
+    },
+    "transformers": {
+        "aliases": ["transformers", "transformer models", "transformer"],
+        "prerequisites": [
+            {
+                "concept_id": "self_attention",
+                "label": "Self Attention",
+                "question": "Before we go deeper into Transformers: can you explain self-attention at a high level?",
+            },
+            {
+                "concept_id": "positional_encoding",
+                "label": "Positional Encoding",
+                "question": "What problem does positional encoding solve in Transformer models?",
+            },
+        ],
+    },
+}
+
+
+def _detect_goal_concept(student_text: str, current_topic: str) -> str:
+    lowered = _norm_text(student_text)
+    for concept_id, meta in PREREQUISITE_CATALOG.items():
+        aliases = meta.get("aliases", [])
+        if any(isinstance(alias, str) and alias in lowered for alias in aliases):
+            return concept_id
+
+    topic_norm = _to_concept_id(current_topic)
+    if topic_norm in PREREQUISITE_CATALOG:
+        return topic_norm
+    return ""
+
+
+def _detect_goal_concept_in_text(student_text: str) -> str:
+    lowered = _norm_text(student_text)
+    for concept_id, meta in PREREQUISITE_CATALOG.items():
+        aliases = meta.get("aliases", [])
+        if any(isinstance(alias, str) and alias in lowered for alias in aliases):
+            return concept_id
+    return ""
+
+
+def _best_proficiency_for_concept(model: Dict[str, Any], concept_id: str, label: str) -> float:
+    topics = model.get("topics")
+    if not isinstance(topics, dict):
+        return 0.0
+
+    wanted_id = _norm_text(concept_id)
+    wanted_label = _norm_text(label)
+    best = 0.0
+    for topic_data in topics.values():
+        if not isinstance(topic_data, dict):
+            continue
+        concepts = topic_data.get("concepts")
+        if not isinstance(concepts, dict):
+            continue
+        for existing_id, meta in concepts.items():
+            if not isinstance(existing_id, str) or not isinstance(meta, dict):
+                continue
+            existing_label = meta.get("label", existing_id)
+            if _norm_text(existing_id) != wanted_id and _norm_text(str(existing_label)) != wanted_label:
+                continue
+            best = max(best, _clamp01(meta.get("proficiency", 0.0)))
+    return best
+
+
+def _first_missing_prerequisite(
+    *,
+    model: Dict[str, Any],
+    goal_concept: str,
+    threshold: float = 0.45,
+) -> Dict[str, Any] | None:
+    meta = PREREQUISITE_CATALOG.get(goal_concept)
+    if not isinstance(meta, dict):
+        return None
+    prereqs = meta.get("prerequisites")
+    if not isinstance(prereqs, list):
+        return None
+
+    for prereq in prereqs:
+        if not isinstance(prereq, dict):
+            continue
+        concept_id = str(prereq.get("concept_id") or "").strip()
+        label = str(prereq.get("label") or concept_id).strip()
+        if not concept_id:
+            continue
+        proficiency = _best_proficiency_for_concept(model, concept_id=concept_id, label=label)
+        if proficiency < threshold:
+            out = dict(prereq)
+            out["proficiency"] = proficiency
+            return out
+    return None
+
+
+def _fallback_delta_for_update(update: Dict[str, Any]) -> float:
+    try:
+        parsed = float(update.get("proficiency_delta", 0.0))
+    except (TypeError, ValueError):
+        parsed = 0.0
+    if abs(parsed) >= 0.01:
+        return parsed
+
+    evidence = update.get("evidence")
+    kind = ""
+    if isinstance(evidence, dict):
+        kind = str(evidence.get("kind") or "").strip().lower()
+
+    if kind in {"correct_explanation", "correct_application"}:
+        return 0.12
+    if kind in {"asked"}:
+        return 0.04
+    if kind in {"introduced"}:
+        return 0.03
+    if kind in {"confused", "incorrect"}:
+        return -0.1
+    return 0.0
+
+
 def _pick_review_target(model: Dict[str, Any], current_topic: str) -> dict[str, Any] | None:
     due = get_due_reviews(model, current_topic=current_topic, limit=1)
     if due:
@@ -235,6 +407,18 @@ def _pick_review_target(model: Dict[str, Any], current_topic: str) -> dict[str, 
             if best is None or candidate["proficiency"] < best["proficiency"]:
                 best = candidate
     return best
+
+
+def _has_review_item(model: Dict[str, Any], concept_id: str) -> bool:
+    queue = model.get("review_queue")
+    if not isinstance(queue, list):
+        return False
+    for item in queue:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("concept_id") or "") == concept_id:
+            return True
+    return False
 
 
 def _merge_concept_updates(
@@ -477,11 +661,28 @@ Return JSON only:
 """
 
 
+FOUNDATION_TEACH_PROMPT = """You are a patient tutor teaching a foundational concept.
+
+Concept: {concept_label}
+Why it matters for next goal: {goal_concept}
+Student message: {student_message}
+
+Write a concise explanation with:
+1) simple definition
+2) one concrete neural-network relevant example
+3) one quick check question at the end
+"""
+
+
 PROGRESS_KEYWORDS = (
     "progress",
     "weakest",
     "show my graph",
     "knowledge graph",
+    "knowlege graph",
+    "current graph",
+    "what do i know",
+    "what concepts do i know",
     "where am i",
     "how am i doing",
 )
@@ -493,16 +694,46 @@ REVIEW_KEYWORDS = (
     "what should i review",
     "due",
 )
+LEARN_INTENT_KEYWORDS = (
+    "i want to learn",
+    "learn about",
+    "teach me",
+    "help me learn",
+    "can you teach",
+)
+TEACH_INTENT_KEYWORDS = (
+    "teach me",
+    "explain",
+    "walk me through",
+    "step by step",
+    "step-by-step",
+)
 
 
 def _is_progress_request(text: str) -> bool:
     lowered = _norm_text(text)
-    return any(keyword in lowered for keyword in PROGRESS_KEYWORDS)
+    if any(keyword in lowered for keyword in PROGRESS_KEYWORDS):
+        return True
+
+    alnum = _norm_alnum(text)
+    if "knowledgegraph" in alnum or "knowlegegraph" in alnum:
+        return True
+    return False
 
 
 def _is_review_request(text: str) -> bool:
     lowered = _norm_text(text)
     return any(keyword in lowered for keyword in REVIEW_KEYWORDS)
+
+
+def _is_learning_intent(text: str) -> bool:
+    lowered = _norm_text(text)
+    return any(keyword in lowered for keyword in LEARN_INTENT_KEYWORDS)
+
+
+def _is_teach_request(text: str) -> bool:
+    lowered = _norm_text(text)
+    return any(keyword in lowered for keyword in TEACH_INTENT_KEYWORDS)
 
 
 def load_student_model(state: TutorState, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -513,6 +744,8 @@ def load_student_model(state: TutorState, config: Dict[str, Any] | None = None) 
         "student_model": ensure_model_shape(model),
         "concept_updates": [],
         "review_result": {},
+        "planned_review_target": {},
+        "planned_goal_concept": "",
         "action_reason": "",
     }
 
@@ -523,6 +756,13 @@ def router(state: TutorState) -> Dict[str, Any]:
     current_topic = state.get("current_topic", "")
     active_review = model.get("active_review", {})
     awaiting_answer = bool(active_review.get("awaiting_answer")) if isinstance(active_review, dict) else False
+    prereq_mode = str(active_review.get("mode") or "") if isinstance(active_review, dict) else ""
+
+    if student_text and _is_progress_request(student_text):
+        return {"next": "progress_report", "action_reason": "explicit progress request"}
+
+    if student_text and _is_teach_request(student_text) and prereq_mode == "prereq_gate":
+        return {"next": "teach_foundation", "action_reason": "user requested foundational teaching"}
 
     if awaiting_answer:
         if student_text:
@@ -532,18 +772,47 @@ def router(state: TutorState) -> Dict[str, Any]:
     if not student_text:
         return {"next": "greet", "action_reason": "session kickoff"}
 
-    if _is_progress_request(student_text):
-        return {"next": "progress_report", "action_reason": "explicit progress request"}
-
     if _is_review_request(student_text):
         return {"next": "ask_review_question", "action_reason": "explicit review request"}
+
+    return {"next": "plan_next_step", "action_reason": "needs planning"}
+
+
+def plan_next_step(state: TutorState) -> Dict[str, Any]:
+    student_text = (state.get("student_answer") or "").strip()
+    model = ensure_model_shape(state.get("student_model") or {})
+    current_topic = state.get("current_topic", "")
+    goal_concept = _detect_goal_concept_in_text(student_text)
+
+    if goal_concept and _is_learning_intent(student_text):
+        missing = _first_missing_prerequisite(model=model, goal_concept=goal_concept)
+        if missing:
+            planned = {
+                "topic": current_topic or goal_concept.replace("_", " ").title(),
+                "concept_id": missing.get("concept_id"),
+                "label": missing.get("label"),
+                "question": missing.get("question"),
+                "goal_concept": goal_concept,
+                "proficiency": missing.get("proficiency", 0.0),
+            }
+            return {
+                "next": "ask_prereq_diagnostic",
+                "planned_review_target": planned,
+                "planned_goal_concept": goal_concept,
+                "current_topic": current_topic or goal_concept.replace("_", " ").title(),
+                "action_reason": "prerequisite gap detected",
+            }
 
     due = get_due_reviews(model, current_topic=current_topic, limit=1)
     turn_count = model.get("meta", {}).get("turn_count", 0) if isinstance(model.get("meta"), dict) else 0
     if due and isinstance(turn_count, int) and turn_count > 0 and turn_count % 4 == 0:
         return {"next": "ask_review_question", "action_reason": "scheduled proactive review"}
 
-    return {"next": "chat", "action_reason": "default tutoring chat"}
+    return {
+        "next": "chat",
+        "planned_goal_concept": goal_concept,
+        "action_reason": "normal tutoring response",
+    }
 
 
 def greet(state: TutorState) -> Dict[str, Any]:
@@ -577,12 +846,117 @@ def progress_report(state: TutorState) -> Dict[str, Any]:
     }
 
 
+def ask_prereq_diagnostic(state: TutorState) -> Dict[str, Any]:
+    model = ensure_model_shape(state.get("student_model") or {})
+    student_text = (state.get("student_answer") or "").strip()
+    planned = state.get("planned_review_target") or {}
+
+    concept_id = str(planned.get("concept_id") or "concept").strip() or "concept"
+    label = str(planned.get("label") or concept_id).strip() or concept_id
+    goal_concept = str(planned.get("goal_concept") or state.get("planned_goal_concept") or "").strip()
+    topic = str(planned.get("topic") or state.get("current_topic") or "General").strip() or "General"
+    question = str(planned.get("question") or "").strip()
+    if not question:
+        question = f"Before we dive deeper, quick check: can you explain {label} in your own words?"
+
+    prompt = (
+        f"Before we go deeper into {goal_concept.replace('_', ' ') if goal_concept else 'this topic'}, "
+        f"I want to verify one foundation concept.\n\nQuick check:\n{question}"
+    )
+
+    model["active_review"] = {
+        "awaiting_answer": True,
+        "topic": topic,
+        "concept_id": concept_id,
+        "label": label,
+        "question": question,
+        "asked_at": _utc_now_iso(),
+        "mode": "prereq_gate",
+        "goal_concept": goal_concept,
+    }
+
+    return {
+        "messages": _append_turn_messages(student_text, prompt),
+        "consumed_student_text": student_text,
+        "student_answer": "",
+        "student_model": model,
+    }
+
+
+def teach_foundation(state: TutorState) -> Dict[str, Any]:
+    model = ensure_model_shape(state.get("student_model") or {})
+    student_text = (state.get("student_answer") or "").strip()
+    active_review = model.get("active_review")
+    if not isinstance(active_review, dict):
+        return {
+            "messages": _append_turn_messages(
+                student_text,
+                "Tell me which concept you want to build first, and I'll teach it step-by-step.",
+            ),
+            "consumed_student_text": student_text,
+            "student_answer": "",
+            "concept_updates": [],
+        }
+
+    label = str(active_review.get("label") or active_review.get("concept_id") or "this concept")
+    goal_concept = str(active_review.get("goal_concept") or "your target topic").replace("_", " ")
+    prompt = FOUNDATION_TEACH_PROMPT.format(
+        concept_label=label,
+        goal_concept=goal_concept,
+        student_message=student_text or "(no extra request)",
+    )
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        explanation = (response.content or "").strip()
+    except Exception:
+        explanation = ""
+
+    if not explanation:
+        explanation = (
+            f"Let's build {label} first.\n\n"
+            f"A simple view: {label} is a mathematical building block used to represent information and transform it in models.\n"
+            "In neural networks, we use these structures to pass data through layers and compute relationships.\n\n"
+            f"Quick check: can you explain {label} and why it matters for {goal_concept}?"
+        )
+
+    active_review["awaiting_answer"] = True
+    active_review["asked_at"] = _utc_now_iso()
+    model["active_review"] = active_review
+
+    concept_id = str(active_review.get("concept_id") or _to_concept_id(label))
+    concept_updates = [
+        {
+            "concept_id": concept_id,
+            "label": label,
+            "proficiency_delta": 0.04,
+            "evidence": {
+                "kind": "introduced",
+                "text": f"Tutor taught foundation concept: {label}",
+                "source": "tutor",
+                "reasoning": "student requested foundational teaching",
+            },
+        }
+    ]
+
+    return {
+        "messages": _append_turn_messages(student_text, explanation),
+        "consumed_student_text": student_text,
+        "student_answer": "",
+        "student_model": model,
+        "concept_updates": concept_updates,
+    }
+
+
 def ask_review_question(state: TutorState) -> Dict[str, Any]:
     model = ensure_model_shape(state.get("student_model") or {})
     current_topic = state.get("current_topic", "")
     student_text = (state.get("student_answer") or "").strip()
 
-    target = _pick_review_target(model, current_topic=current_topic)
+    planned = state.get("planned_review_target") or {}
+    if isinstance(planned, dict) and planned.get("concept_id"):
+        target = planned
+    else:
+        target = _pick_review_target(model, current_topic=current_topic)
     if not target:
         msg = (
             "No review targets yet. Ask me to teach a topic first, then I can "
@@ -669,6 +1043,15 @@ def grade_review_answer(state: TutorState) -> Dict[str, Any]:
     except Exception:
         pass
 
+    floor_score = _minimum_score_from_overlap(label=label, question=question, answer=student_text)
+    if floor_score > score:
+        score = floor_score
+        if score >= 30:
+            feedback = (
+                "You showed partial understanding, but the explanation is still missing key details. "
+                "Let's tighten the definition and one concrete example."
+            )
+
     score = max(0, min(100, score))
     delta = _delta_from_score(score)
     quality = _quality_from_score(score)
@@ -690,11 +1073,22 @@ def grade_review_answer(state: TutorState) -> Dict[str, Any]:
     active_review["last_answer_at"] = _utc_now_iso()
     model["active_review"] = active_review
 
-    next_step = (
-        "Great work. Want another review question or a harder application example?"
-        if score >= 75
-        else "Let's reinforce this. Ask me for a focused explanation or another review question."
-    )
+    mode = str(active_review.get("mode") or "")
+    goal_concept = str(active_review.get("goal_concept") or "").replace("_", " ").strip()
+    if mode == "prereq_gate" and goal_concept:
+        if score >= 70:
+            next_step = f"Nice. You have enough foundation to continue with {goal_concept}."
+        else:
+            next_step = (
+                f"We should reinforce {label} first, then return to {goal_concept}. "
+                f"Ask me to teach {label} step-by-step."
+            )
+    else:
+        next_step = (
+            "Great work. Want another review question or a harder application example?"
+            if score >= 75
+            else "Let's reinforce this. Ask me for a focused explanation or another review question."
+        )
     reply = f"Review score: {score}/100\n{feedback}\n\n{next_step}"
 
     return {
@@ -794,7 +1188,35 @@ def observe_learning(state: TutorState) -> Dict[str, Any]:
     if isinstance(raw_updates, list):
         for item in raw_updates:
             if isinstance(item, dict):
+                item = dict(item)
+                item["proficiency_delta"] = _fallback_delta_for_update(item)
                 concept_updates.append(item)
+
+    if not concept_updates and isinstance(last_user, str) and last_user.strip():
+        lowered = _norm_text(last_user)
+        inferred_delta = 0.0
+        inferred_kind = "observation"
+        if any(phrase in lowered for phrase in ("i think i get", "i get it", "makes sense", "got it")):
+            inferred_delta = 0.06
+            inferred_kind = "correct_explanation"
+        elif any(phrase in lowered for phrase in ("confused", "dont get", "don't get", "not sure", "lost")):
+            inferred_delta = -0.08
+            inferred_kind = "confused"
+
+        if abs(inferred_delta) >= 0.01 and new_topic and new_topic != "General":
+            concept_updates.append(
+                {
+                    "concept_id": _to_concept_id(new_topic),
+                    "label": new_topic.replace("_", " ").title(),
+                    "proficiency_delta": inferred_delta,
+                    "evidence": {
+                        "kind": inferred_kind,
+                        "text": last_user[:180],
+                        "source": "student",
+                        "reasoning": "heuristic fallback from student self-report",
+                    },
+                }
+            )
 
     return {
         "current_topic": new_topic,
@@ -843,7 +1265,8 @@ def update_student_model(state: TutorState, config: Dict[str, Any] | None = None
                 delta = float(update.get("proficiency_delta", 0.0))
             except (TypeError, ValueError):
                 delta = 0.0
-            if abs(delta) < 0.05:
+            should_seed = not _has_review_item(model, concept_id=concept_id)
+            if abs(delta) < 0.03 and not should_seed:
                 continue
             prof = _concept_proficiency(model, topic, concept_id)
             model = update_review_queue(
@@ -883,6 +1306,8 @@ def update_student_model(state: TutorState, config: Dict[str, Any] | None = None
         "student_model": model,
         "concept_updates": [],
         "review_result": {},
+        "planned_review_target": {},
+        "planned_goal_concept": "",
         "consumed_student_text": "",
     }
 
@@ -892,8 +1317,11 @@ def create_tutor_graph():
 
     graph.add_node("load_student_model", load_student_model)
     graph.add_node("router", router)
+    graph.add_node("plan_next_step", plan_next_step)
     graph.add_node("greet", greet)
     graph.add_node("progress_report", progress_report)
+    graph.add_node("ask_prereq_diagnostic", ask_prereq_diagnostic)
+    graph.add_node("teach_foundation", teach_foundation)
     graph.add_node("ask_review_question", ask_review_question)
     graph.add_node("grade_review_answer", grade_review_answer)
     graph.add_node("chat", chat)
@@ -911,12 +1339,25 @@ def create_tutor_graph():
             "progress_report": "progress_report",
             "ask_review_question": "ask_review_question",
             "grade_review_answer": "grade_review_answer",
+            "plan_next_step": "plan_next_step",
+            "teach_foundation": "teach_foundation",
+        },
+    )
+
+    graph.add_conditional_edges(
+        "plan_next_step",
+        lambda state: state["next"],
+        {
+            "ask_prereq_diagnostic": "ask_prereq_diagnostic",
+            "ask_review_question": "ask_review_question",
             "chat": "chat",
         },
     )
 
     graph.add_edge("greet", "update_student_model")
     graph.add_edge("progress_report", "update_student_model")
+    graph.add_edge("ask_prereq_diagnostic", "update_student_model")
+    graph.add_edge("teach_foundation", "update_student_model")
     graph.add_edge("ask_review_question", "update_student_model")
     graph.add_edge("grade_review_answer", "update_student_model")
     graph.add_edge("chat", "observe_learning")
