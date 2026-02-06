@@ -1,0 +1,47 @@
+# Environment variables (contains secrets)
+.env
+.env.*
+!.env.example
+
+# Local app data / generated artifacts
+.knowledge_graphs/
+student_store.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Vector stores / embeddings DBs
+**/.chroma_db/
+
+# Logs
+*.log
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+conda/
