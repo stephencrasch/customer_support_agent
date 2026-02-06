@@ -64,6 +64,7 @@ def default_student_model() -> dict[str, Any]:
         "topics": {},  # Structure: {topic_name: {concepts: {}, last_studied: str, total_practice: int}}
         "review_queue": [],
         "active_review": {},
+        "paused_reviews": [],
         "meta": {"turn_count": 0},
         "turn_log": [],
         "updated_at": _utc_now_iso(),
@@ -93,6 +94,11 @@ def ensure_model_shape(model: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(active_review, dict):
         active_review = {}
     safe["active_review"] = active_review
+
+    paused_reviews = safe.get("paused_reviews")
+    if not isinstance(paused_reviews, list):
+        paused_reviews = []
+    safe["paused_reviews"] = paused_reviews
 
     meta = safe.get("meta")
     if not isinstance(meta, dict):

@@ -79,7 +79,7 @@ def main() -> None:
 
     print("\n✅ Session started")
     print(f"   Thread: {thread_id}")
-    print("\n💡 Just start chatting - I'll figure out what you want to learn!")
+    print("\n💡 Just start chatting. If you had unfinished review checks, we'll resume them.")
 
     # First run: empty student_answer to trigger a greeting.
     state = app.invoke({"current_topic": "", "student_answer": "", "messages": []}, config=config)

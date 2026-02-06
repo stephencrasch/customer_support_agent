@@ -425,6 +425,7 @@ def _extract_llm_concept_updates(
             evidence_text = message
         updates.append(
             {
+                "topic": (current_topic or "General").strip() or "General",
                 "concept_id": concept_id,
                 "label": label,
                 "proficiency_delta": 0.02,
@@ -618,14 +619,20 @@ def _infer_requested_review_target(
     }
 
 
-def _has_review_item(model: Dict[str, Any], concept_id: str) -> bool:
+def _has_review_item(model: Dict[str, Any], concept_id: str, topic: str = "") -> bool:
     queue = model.get("review_queue")
     if not isinstance(queue, list):
         return False
+    topic_norm = (topic or "").strip().lower()
     for item in queue:
         if not isinstance(item, dict):
             continue
-        if str(item.get("concept_id") or "") == concept_id:
+        if str(item.get("concept_id") or "") != concept_id:
+            continue
+        item_topic = str(item.get("topic") or "").strip().lower()
+        if topic_norm and item_topic != topic_norm:
+            continue
+        if not topic_norm or item_topic == topic_norm:
             return True
     return False
 
@@ -639,22 +646,8 @@ def _merge_concept_updates(
 ) -> Dict[str, Any]:
     model = ensure_model_shape(model)
     topics = model.get("topics", {})
-    topic = (current_topic or "General").strip() or "General"
-
-    topic_data = topics.get(topic, {})
-    if not isinstance(topic_data, dict):
-        topic_data = {"concepts": {}, "last_studied": None, "total_practice": 0}
-
-    concepts = topic_data.get("concepts", {})
-    if not isinstance(concepts, dict):
-        concepts = {}
-
-    labels = _collect_concept_labels({"concepts": concepts})
-    name_to_id: Dict[str, str] = {}
-    for concept_id, names in labels.items():
-        for name in names:
-            if name and name not in name_to_id:
-                name_to_id[name] = concept_id
+    if not isinstance(topics, dict):
+        topics = {}
 
     now = _utc_now_iso()
 
@@ -665,6 +658,22 @@ def _merge_concept_updates(
         label = update.get("label")
         if not isinstance(label, str) or not label.strip():
             continue
+
+        topic = str(update.get("topic") or current_topic or "General").strip() or "General"
+        topic_data = topics.get(topic, {})
+        if not isinstance(topic_data, dict):
+            topic_data = {"concepts": {}, "last_studied": None, "total_practice": 0}
+
+        concepts = topic_data.get("concepts", {})
+        if not isinstance(concepts, dict):
+            concepts = {}
+
+        labels = _collect_concept_labels({"concepts": concepts})
+        name_to_id: Dict[str, str] = {}
+        for concept_id, names in labels.items():
+            for name in names:
+                if name and name not in name_to_id:
+                    name_to_id[name] = concept_id
 
         requested_id = update.get("concept_id")
         guess_id = requested_id if isinstance(requested_id, str) and requested_id.strip() else _to_concept_id(label)
@@ -769,15 +778,15 @@ def _merge_concept_updates(
             meta["evidence"] = history[-evidence_per_concept:]
 
         concepts[target_id] = meta
+        topic_data["concepts"] = concepts
+        topic_data["last_studied"] = now
+        try:
+            practice_total = int(topic_data.get("total_practice", 0))
+        except (TypeError, ValueError):
+            practice_total = 0
+        topic_data["total_practice"] = practice_total + 1
+        topics[topic] = topic_data
 
-    topic_data["concepts"] = concepts
-    topic_data["last_studied"] = now
-    try:
-        practice_total = int(topic_data.get("total_practice", 0))
-    except (TypeError, ValueError):
-        practice_total = 0
-    topic_data["total_practice"] = practice_total + len(updates or [])
-    topics[topic] = topic_data
     model["topics"] = topics
     return model
 
@@ -875,12 +884,18 @@ FOUNDATION_TEACH_PROMPT = """You are a patient tutor teaching a foundational con
 
 Concept: {concept_label}
 Why it matters for next goal: {goal_concept}
+Current topic context: {current_topic}
 Student message: {student_message}
 
 Write a concise explanation with:
 1) simple definition
-2) one concrete neural-network relevant example
+2) one concrete, domain-relevant example
 3) one quick check question at the end
+
+Teaching style rules:
+- Keep the explanation conversational, not rigidly templated.
+- Use neural-network examples only when they are relevant to the concept/topic.
+- If the student asked about a different concept than the pending one, acknowledge the switch briefly.
 """
 
 
@@ -949,6 +964,45 @@ Rules:
 - Choose ask_review_question for explicit requests to review, quiz, or practice.
 - Choose teach_foundation only when the student clearly asks to teach/explain and prereq_context is true.
 - Otherwise choose plan_next_step.
+"""
+
+
+PENDING_REVIEW_ROUTER_PROMPT = """Route the student's latest message while a review question is pending.
+
+Student message:
+{student_message}
+
+Pending review question:
+{pending_question}
+
+Pending concept:
+{pending_concept}
+
+Current topic:
+{current_topic}
+
+Prerequisite-gate context:
+{prereq_context}
+
+Current review snapshot:
+{review_snapshot}
+
+Return JSON only:
+{{
+  "next_action": "grade_review_answer|teach_foundation|remind_review_question|progress_report|chat|plan_next_step",
+  "reason": "short reason",
+  "confidence": 0.0,
+  "pause_pending_review": false
+}}
+
+Rules:
+- Treat short attempts like "I don't know", "I can't", or partial answers as grade_review_answer (they are valid attempts).
+- Choose teach_foundation when the student asks to be taught/explained before answering.
+- Choose remind_review_question for defer/pause/skip requests about the pending question.
+- Choose progress_report only for explicit progress/graph requests.
+- Choose chat for social talk not tied to a task.
+- Choose plan_next_step for explicit task switches or topic switches unrelated to the pending question.
+- If you choose plan_next_step because the student switched tasks/topics, set pause_pending_review=true.
 """
 
 
@@ -1092,38 +1146,6 @@ def _is_defer_review_request(text: str) -> bool:
     return any(keyword in lowered for keyword in DEFER_REVIEW_KEYWORDS)
 
 
-def _is_clarification_request(text: str) -> bool:
-    lowered = _norm_text(text)
-    if not lowered:
-        return False
-    if "?" not in lowered and not lowered.startswith(("wait", "hold on", "but ")):
-        return False
-    prefixes = (
-        "can you",
-        "could you",
-        "would you",
-        "what do you mean",
-        "why",
-        "how",
-        "wait",
-        "hold on",
-        "but ",
-    )
-    return any(lowered.startswith(prefix) for prefix in prefixes)
-
-
-def _looks_like_substantive_answer(text: str) -> bool:
-    lowered = _norm_text(text)
-    if not lowered:
-        return False
-    if _is_defer_review_request(text):
-        return False
-    if _has_explicit_task_intent(text) or _is_social_message(text) or _is_clarification_request(text):
-        return False
-    words = [token for token in lowered.split() if any(ch.isalpha() for ch in token)]
-    return len(words) >= 3
-
-
 def _has_explicit_task_intent(text: str) -> bool:
     return (
         _is_progress_request(text)
@@ -1174,7 +1196,7 @@ def _route_intent_with_reasoning(
     current_topic: str,
     prereq_context: bool,
     model: Dict[str, Any],
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     prompt = INTENT_ROUTER_PROMPT.format(
         student_message=student_text or "(empty)",
         current_topic=current_topic or "General",
@@ -1192,33 +1214,152 @@ def _route_intent_with_reasoning(
     valid = {"chat", "progress_report", "ask_review_question", "teach_foundation", "plan_next_step"}
     if next_action not in valid:
         next_action = ""
-    if prereq_context and _is_teach_request(student_text) and not _is_progress_request(student_text):
-        next_action = "teach_foundation"
     if next_action == "teach_foundation" and not prereq_context:
         next_action = "plan_next_step"
 
     reason = str(data.get("reason") or "").strip()
+    confidence = _clamp01(data.get("confidence", 0.0))
 
     if not next_action:
         if _is_progress_request(student_text):
             next_action = "progress_report"
             reason = reason or "fallback keyword progress intent"
+            confidence = max(confidence, 0.78)
         elif _is_review_request(student_text):
             next_action = "ask_review_question"
             reason = reason or "fallback keyword review intent"
+            confidence = max(confidence, 0.74)
         elif prereq_context and _is_teach_request(student_text):
             next_action = "teach_foundation"
             reason = reason or "fallback keyword prereq-teach intent"
+            confidence = max(confidence, 0.7)
         elif _is_social_message(student_text):
             next_action = "chat"
             reason = reason or "fallback social-chat intent"
+            confidence = max(confidence, 0.68)
         else:
             next_action = "plan_next_step"
             reason = reason or "fallback to planner"
+            confidence = max(confidence, 0.4)
     elif not reason:
         reason = "semantic intent routing"
+    elif confidence <= 0.0:
+        confidence = 0.6
 
-    return {"next_action": next_action, "reason": reason}
+    return {"next_action": next_action, "reason": reason, "confidence": confidence}
+
+
+def _pause_active_review(*, model: Dict[str, Any], student_text: str, reason: str) -> Dict[str, Any]:
+    safe = ensure_model_shape(model)
+    active_review = safe.get("active_review")
+    if not isinstance(active_review, dict) or not active_review.get("awaiting_answer"):
+        return safe
+
+    paused_reviews = safe.get("paused_reviews")
+    if not isinstance(paused_reviews, list):
+        paused_reviews = []
+
+    paused = dict(active_review)
+    paused["awaiting_answer"] = False
+    paused["paused_at"] = _utc_now_iso()
+    paused["pause_reason"] = reason
+    if student_text:
+        paused["paused_by"] = student_text[:180]
+    paused_reviews.append(paused)
+
+    safe["paused_reviews"] = paused_reviews[-8:]
+    safe["active_review"] = {}
+    return safe
+
+
+def _route_pending_review_with_reasoning(
+    *,
+    student_text: str,
+    model: Dict[str, Any],
+    active_review: Dict[str, Any],
+    current_topic: str,
+    prereq_context: bool,
+) -> Dict[str, Any]:
+    question = str(active_review.get("question") or "").strip()
+    if not question:
+        question = "Please answer the pending review question in your own words."
+    concept = str(active_review.get("label") or active_review.get("concept_id") or "current concept")
+
+    prompt = PENDING_REVIEW_ROUTER_PROMPT.format(
+        student_message=student_text or "(empty)",
+        pending_question=question,
+        pending_concept=concept,
+        current_topic=current_topic or "General",
+        prereq_context="yes" if prereq_context else "no",
+        review_snapshot=review_snapshot(model, current_topic=current_topic, limit=3),
+    )
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        data = extract_json(response.content)
+    except Exception:
+        data = {}
+
+    next_action = str(data.get("next_action") or "").strip().lower()
+    valid = {
+        "grade_review_answer",
+        "teach_foundation",
+        "remind_review_question",
+        "progress_report",
+        "chat",
+        "plan_next_step",
+    }
+    if next_action not in valid:
+        next_action = ""
+
+    reason = str(data.get("reason") or "").strip()
+    confidence = _clamp01(data.get("confidence", 0.0))
+    pause_pending_review = bool(data.get("pause_pending_review"))
+    if not next_action:
+        if not student_text:
+            next_action = "remind_review_question"
+            reason = reason or "empty response while review pending"
+            confidence = max(confidence, 0.78)
+        elif _is_defer_review_request(student_text):
+            next_action = "remind_review_question"
+            reason = reason or "fallback defer pending review"
+            confidence = max(confidence, 0.72)
+        elif _is_progress_request(student_text):
+            next_action = "progress_report"
+            reason = reason or "fallback progress request"
+            confidence = max(confidence, 0.78)
+        elif _is_review_request(student_text):
+            next_action = "remind_review_question"
+            reason = reason or "fallback review request while pending"
+            confidence = max(confidence, 0.68)
+        elif _is_learning_intent(student_text) or _is_teach_request(student_text):
+            next_action = "plan_next_step"
+            reason = reason or "fallback task switch while review pending"
+            confidence = max(confidence, 0.62)
+            pause_pending_review = True
+        elif _is_social_message(student_text) and not _has_explicit_task_intent(student_text):
+            next_action = "chat"
+            reason = reason or "fallback social message"
+            confidence = max(confidence, 0.66)
+        else:
+            next_action = "grade_review_answer"
+            reason = reason or "fallback treat message as review attempt"
+            confidence = max(confidence, 0.42)
+    elif not reason:
+        reason = "semantic pending-review routing"
+    elif confidence <= 0.0:
+        confidence = 0.6
+
+    if next_action == "plan_next_step":
+        pause_pending_review = True
+    else:
+        pause_pending_review = False
+
+    return {
+        "next_action": next_action,
+        "reason": reason,
+        "confidence": confidence,
+        "pause_pending_review": pause_pending_review,
+    }
 
 
 def load_student_model(state: TutorState, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -1249,25 +1390,41 @@ def router(state: TutorState) -> Dict[str, Any]:
     ) if isinstance(active_review, dict) else False
 
     if awaiting_answer:
-        if not student_text:
-            return {"next": "remind_review_question", "action_reason": "reminding pending review question"}
-        if _is_defer_review_request(student_text):
-            return {"next": "remind_review_question", "action_reason": "student deferred pending review question"}
-        if _is_progress_request(student_text):
-            return {"next": "progress_report", "action_reason": "progress request while review pending"}
-        if prereq_context and _is_teach_request(student_text):
-            return {"next": "teach_foundation", "action_reason": "explicit teach request during prereq review"}
-        if _is_learning_intent(student_text) or _is_teach_request(student_text):
-            return {"next": "chat", "action_reason": "learning request while review pending"}
-        if _is_review_request(student_text):
-            return {"next": "remind_review_question", "action_reason": "review request while another review is pending"}
-        if _is_social_message(student_text) or _is_clarification_request(student_text):
-            return {"next": "chat", "action_reason": "conversation/clarification while review pending"}
-        if _has_explicit_task_intent(student_text):
-            return {"next": "plan_next_step", "action_reason": "task request while review pending"}
-        if _looks_like_substantive_answer(student_text):
-            return {"next": "grade_review_answer", "action_reason": "grading pending review answer"}
-        return {"next": "remind_review_question", "action_reason": "reminding pending review question"}
+        decision = _route_pending_review_with_reasoning(
+            student_text=student_text,
+            model=model,
+            active_review=active_review if isinstance(active_review, dict) else {},
+            current_topic=current_topic,
+            prereq_context=prereq_context,
+        )
+        next_action = str(decision.get("next_action") or "remind_review_question")
+        reason = str(decision.get("reason") or "semantic pending-review routing")
+        pending_confidence = _clamp01(decision.get("confidence", 0.0))
+        pause_pending_review = bool(decision.get("pause_pending_review"))
+
+        # Let a strong general-intent signal break out of pending-review mode.
+        if student_text and next_action in {"grade_review_answer", "teach_foundation", "remind_review_question"}:
+            general_decision = _route_intent_with_reasoning(
+                student_text=student_text,
+                current_topic=current_topic,
+                prereq_context=prereq_context,
+                model=model,
+            )
+            general_action = str(general_decision.get("next_action") or "")
+            general_confidence = _clamp01(general_decision.get("confidence", 0.0))
+            if general_action in {"plan_next_step", "progress_report"} and general_confidence >= max(0.65, pending_confidence + 0.15):
+                next_action = general_action
+                reason = f"intent override from general router: {general_decision.get('reason', 'semantic intent')}"
+                pause_pending_review = general_action == "plan_next_step"
+
+        result: Dict[str, Any] = {
+            "next": next_action,
+            "action_reason": reason,
+        }
+        if pause_pending_review:
+            result["student_model"] = _pause_active_review(model=model, student_text=student_text, reason=reason)
+
+        return result
 
     if not student_text:
         return {"next": "greet", "action_reason": "session kickoff"}
@@ -1424,6 +1581,7 @@ def ask_prereq_diagnostic(state: TutorState) -> Dict[str, Any]:
 
     concept_updates: List[Dict[str, Any]] = [
         {
+            "topic": topic,
             "concept_id": concept_id,
             "label": label,
             "proficiency_delta": 0.02,
@@ -1439,6 +1597,7 @@ def ask_prereq_diagnostic(state: TutorState) -> Dict[str, Any]:
     if goal_id and goal_id != concept_id:
         concept_updates.append(
             {
+                "topic": topic,
                 "concept_id": goal_id,
                 "label": goal_concept.replace("_", " ").title(),
                 "proficiency_delta": 0.02,
@@ -1477,9 +1636,11 @@ def teach_foundation(state: TutorState) -> Dict[str, Any]:
 
     label = str(active_review.get("label") or active_review.get("concept_id") or "this concept")
     goal_concept = str(active_review.get("goal_concept") or "your target topic").replace("_", " ")
+    foundation_topic = str(active_review.get("topic") or state.get("current_topic") or "General").strip() or "General"
     prompt = FOUNDATION_TEACH_PROMPT.format(
         concept_label=label,
         goal_concept=goal_concept,
+        current_topic=foundation_topic,
         student_message=student_text or "(no extra request)",
     )
     try:
@@ -1508,6 +1669,7 @@ def teach_foundation(state: TutorState) -> Dict[str, Any]:
     concept_id = str(active_review.get("concept_id") or _to_concept_id(label))
     concept_updates = [
         {
+            "topic": foundation_topic,
             "concept_id": concept_id,
             "label": label,
             "proficiency_delta": 0.04,
@@ -1523,6 +1685,7 @@ def teach_foundation(state: TutorState) -> Dict[str, Any]:
     if goal_id and goal_id != concept_id:
         concept_updates.append(
             {
+                "topic": foundation_topic,
                 "concept_id": goal_id,
                 "label": str(active_review.get("goal_concept") or goal_id).replace("_", " ").title(),
                 "proficiency_delta": 0.02,
@@ -1571,9 +1734,16 @@ def remind_review_question(state: TutorState) -> Dict[str, Any]:
                     f"{question}"
                 )
         elif mode == "prereq_gate" and goal:
-            message = f"Quick check before we continue with {goal}:\n{question}"
+            message = (
+                f"You have an unfinished quick check before we continue with {goal}:\n"
+                f"{question}\n\n"
+                "You can answer now, ask me to teach it first, or switch topics and I will pause this check."
+            )
         else:
-            message = f"You still have a pending review question:\n{question}"
+            message = (
+                f"You still have a pending review question:\n{question}\n\n"
+                "You can answer now, or switch topics and I will pause this check."
+            )
 
     return {
         "messages": _append_turn_messages(student_text, message),
@@ -1665,6 +1835,7 @@ def ask_review_question(state: TutorState) -> Dict[str, Any]:
     if requested_target:
         concept_updates.append(
             {
+                "topic": topic,
                 "concept_id": concept_id,
                 "label": label,
                 "proficiency_delta": 0.02,
@@ -1677,7 +1848,7 @@ def ask_review_question(state: TutorState) -> Dict[str, Any]:
             }
         )
 
-    if requested_target and not _has_review_item(model, concept_id=concept_id):
+    if requested_target and not _has_review_item(model, concept_id=concept_id, topic=topic):
         review_text = f"Let's start with a quick baseline check for {label}.\n\nReview check:\n{question}"
     else:
         review_text = f"Review check:\n{question}"
@@ -1709,28 +1880,6 @@ def grade_review_answer(state: TutorState) -> Dict[str, Any]:
     concept_id = str(active_review.get("concept_id") or "concept")
     label = str(active_review.get("label") or concept_id)
     question = str(active_review.get("question") or "")
-    if (
-        _is_defer_review_request(student_text)
-        or _is_progress_request(student_text)
-        or _is_review_request(student_text)
-        or _is_learning_intent(student_text)
-        or _is_teach_request(student_text)
-        or _is_social_message(student_text)
-        or _is_clarification_request(student_text)
-        or not _looks_like_substantive_answer(student_text)
-    ):
-        pause_msg = (
-            "I read that as a request, not an answer to the pending review question.\n"
-            f"When you're ready, answer this question:\n{question}"
-        )
-        return {
-            "messages": _append_turn_messages(student_text, pause_msg),
-            "consumed_student_text": student_text,
-            "student_answer": "",
-            "student_model": model,
-            "review_result": {},
-            "concept_updates": [],
-        }
 
     prompt = REVIEW_GRADER_PROMPT.format(
         topic=topic,
@@ -1784,6 +1933,7 @@ def grade_review_answer(state: TutorState) -> Dict[str, Any]:
         evidence_kind = "observation"
 
     concept_update = {
+        "topic": topic,
         "concept_id": concept_id,
         "label": label,
         "proficiency_delta": delta,
@@ -1924,6 +2074,7 @@ def observe_learning(state: TutorState) -> Dict[str, Any]:
         for item in raw_updates:
             if isinstance(item, dict):
                 item = dict(item)
+                item["topic"] = str(item.get("topic") or new_topic or current_topic or "General").strip() or "General"
                 item["proficiency_delta"] = _fallback_delta_for_update(item)
                 observed_updates.append(item)
 
@@ -1941,6 +2092,7 @@ def observe_learning(state: TutorState) -> Dict[str, Any]:
         if abs(inferred_delta) >= 0.01 and new_topic and new_topic != "General":
             observed_updates.append(
                 {
+                    "topic": new_topic,
                     "concept_id": _to_concept_id(new_topic),
                     "label": new_topic.replace("_", " ").title(),
                     "proficiency_delta": inferred_delta,
@@ -2002,6 +2154,7 @@ def update_student_model(state: TutorState, config: Dict[str, Any] | None = None
         for update in concept_updates:
             if not isinstance(update, dict):
                 continue
+            update_topic = str(update.get("topic") or topic).strip() or topic
             concept_id = str(update.get("concept_id") or "")
             label = str(update.get("label") or concept_id or "")
             if not concept_id or not label:
@@ -2010,13 +2163,13 @@ def update_student_model(state: TutorState, config: Dict[str, Any] | None = None
                 delta = float(update.get("proficiency_delta", 0.0))
             except (TypeError, ValueError):
                 delta = 0.0
-            should_seed = not _has_review_item(model, concept_id=concept_id)
+            should_seed = not _has_review_item(model, concept_id=concept_id, topic=update_topic)
             if abs(delta) < 0.03 and not should_seed:
                 continue
-            prof = _concept_proficiency(model, topic, concept_id)
+            prof = _concept_proficiency(model, update_topic, concept_id)
             model = update_review_queue(
                 model,
-                topic=topic,
+                topic=update_topic,
                 concept_id=concept_id,
                 label=label,
                 quality=_quality_from_delta(delta),
