@@ -23,6 +23,7 @@ from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
 from student_store import (
+    canonicalize_topic_label,
     ensure_model_shape,
     get_due_reviews,
     load_student_model as store_load_student_model,
@@ -666,7 +667,7 @@ def _merge_concept_updates(
         if not isinstance(label, str) or not label.strip():
             continue
 
-        topic = str(update.get("topic") or current_topic or "General").strip() or "General"
+        topic = canonicalize_topic_label(str(update.get("topic") or current_topic or "General"))
         topic_data = topics.get(topic, {})
         if not isinstance(topic_data, dict):
             topic_data = {"concepts": {}, "last_studied": None, "total_practice": 0}
@@ -1387,10 +1388,11 @@ def _has_explicit_task_intent(text: str) -> bool:
 
 
 def _topic_has_history(model: Dict[str, Any], topic: str) -> bool:
-    topic_name = (topic or "").strip()
+    topic_name = canonicalize_topic_label(topic or "")
     if not topic_name:
         return False
-    topics = model.get("topics")
+    safe = ensure_model_shape(model)
+    topics = safe.get("topics")
     if not isinstance(topics, dict):
         return False
     topic_data = topics.get(topic_name)
@@ -1489,7 +1491,219 @@ def _extract_target_topic(text: str) -> str:
     candidate = _first_concept_fragment(candidate)
     if not candidate:
         return ""
-    return candidate.strip().title()
+    return canonicalize_topic_label(candidate.strip())
+
+
+def _extract_progress_scope_topic(student_text: str, model: Dict[str, Any]) -> str:
+    lowered = _norm_text(student_text)
+    if not lowered:
+        return ""
+    if any(marker in lowered for marker in ("all topics", "overall", "across topics", "global progress")):
+        return ""
+
+    topics = model.get("topics")
+    if not isinstance(topics, dict) or not topics:
+        return ""
+
+    candidates = sorted((str(name) for name in topics.keys()), key=len, reverse=True)
+    for topic_name in candidates:
+        topic_norm = _norm_text(topic_name)
+        if not topic_norm:
+            continue
+        if topic_norm not in lowered:
+            continue
+        if any(f"{prefix}{topic_norm}" in lowered for prefix in ("for ", "on ", "in ", "about ")):
+            return canonicalize_topic_label(topic_name)
+    return ""
+
+
+def _update_evidence_kind(update: Dict[str, Any]) -> str:
+    evidence = update.get("evidence")
+    if isinstance(evidence, dict):
+        return str(evidence.get("kind") or "").strip().lower()
+    return ""
+
+
+def _topic_concepts(model: Dict[str, Any], topic: str) -> Dict[str, Any]:
+    safe = ensure_model_shape(model)
+    topics = safe.get("topics")
+    if not isinstance(topics, dict):
+        return {}
+    topic_data = topics.get(canonicalize_topic_label(topic))
+    if not isinstance(topic_data, dict):
+        return {}
+    concepts = topic_data.get("concepts")
+    if not isinstance(concepts, dict):
+        return {}
+    return concepts
+
+
+def _concept_base_key(text: str) -> str:
+    raw = _norm_text(str(text or "").replace("_", " ").replace("-", " "))
+    if not raw:
+        return ""
+    tokens = [token for token in raw.split() if token]
+    if not tokens:
+        return ""
+
+    drop_tokens = {
+        "concept",
+        "concepts",
+        "mechanism",
+        "mechanisms",
+        "basic",
+        "basics",
+        "overview",
+        "intro",
+        "introduction",
+        "topic",
+        "topics",
+        "theory",
+    }
+    normalized: List[str] = []
+    for token in tokens:
+        cleaned = "".join(ch for ch in token if ch.isalnum())
+        if not cleaned:
+            continue
+        if cleaned.endswith("s") and len(cleaned) > 3:
+            cleaned = cleaned[:-1]
+        if cleaned in drop_tokens:
+            continue
+        normalized.append(cleaned)
+    if not normalized:
+        normalized = ["".join(ch for ch in token if ch.isalnum()) for token in tokens]
+        normalized = [token for token in normalized if token]
+    return " ".join(normalized)
+
+
+def _find_similar_concept_in_topic(
+    model: Dict[str, Any], topic: str, concept_id: str, label: str
+) -> tuple[str, str]:
+    concepts = _topic_concepts(model, topic)
+    if not concepts:
+        return ("", "")
+
+    wanted = _concept_base_key(label) or _concept_base_key(concept_id)
+    if not wanted:
+        return ("", "")
+
+    for existing_id, meta in concepts.items():
+        if not isinstance(existing_id, str) or not isinstance(meta, dict):
+            continue
+        existing_label = str(meta.get("label") or existing_id)
+        existing_key = _concept_base_key(existing_label) or _concept_base_key(existing_id)
+        if not existing_key:
+            continue
+        if existing_key == wanted:
+            return (existing_id, existing_label)
+    return ("", "")
+
+
+def _concept_exists(model: Dict[str, Any], topic: str, concept_id: str, label: str) -> bool:
+    concepts = _topic_concepts(model, topic)
+    if not concepts:
+        return False
+
+    wanted_id = _to_optional_concept_id(concept_id)
+    wanted_label = _norm_text(label)
+    for existing_id, meta in concepts.items():
+        if not isinstance(existing_id, str) or not isinstance(meta, dict):
+            continue
+        existing_label = _norm_text(str(meta.get("label") or existing_id))
+        if wanted_id and _to_optional_concept_id(existing_id) == wanted_id:
+            return True
+        if wanted_label and existing_label == wanted_label:
+            return True
+    return False
+
+
+def _is_meta_progress_text(text: str) -> bool:
+    lowered = _norm_text(text)
+    if not lowered:
+        return False
+    markers = (
+        "show my progress",
+        "knowledge graph",
+        "student model",
+        "what are my topics",
+        "what do i know",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _filter_concept_updates_for_persistence(
+    *,
+    model: Dict[str, Any],
+    updates: List[Dict[str, Any]],
+    route_intent: str,
+    default_topic: str,
+) -> List[Dict[str, Any]]:
+    if not isinstance(updates, list):
+        return []
+
+    intent = (route_intent or "").strip().lower()
+    if intent in {"session_start", "progress", "pending_social", "pending_defer"}:
+        return []
+
+    by_key: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for raw in updates:
+        if not isinstance(raw, dict):
+            continue
+
+        topic = canonicalize_topic_label(str(raw.get("topic") or default_topic or "General"))
+        label = str(raw.get("label") or "").strip()
+        concept_id = _to_optional_concept_id(str(raw.get("concept_id") or label))
+        if not concept_id:
+            continue
+        if not label:
+            label = concept_id.replace("_", " ").title()
+
+        row = dict(raw)
+        row["topic"] = topic
+        similar_id, similar_label = _find_similar_concept_in_topic(
+            model,
+            topic=topic,
+            concept_id=concept_id,
+            label=label,
+        )
+        if similar_id:
+            concept_id = similar_id
+            label = similar_label or label
+        row["concept_id"] = concept_id
+        row["label"] = label
+        row["proficiency_delta"] = max(-0.2, min(0.2, _fallback_delta_for_update(row)))
+
+        kind = _update_evidence_kind(row)
+        evidence = row.get("evidence")
+        evidence_text = ""
+        if isinstance(evidence, dict):
+            evidence_text = str(evidence.get("text") or "")
+        is_meta = _is_meta_progress_text(evidence_text)
+
+        exists = bool(similar_id) or _concept_exists(model, topic, concept_id, label)
+        delta = abs(float(row.get("proficiency_delta", 0.0)))
+
+        # Drop weak mention/observation writes for new concepts.
+        if not exists and kind in {"mentioned", "observation"} and delta < 0.05:
+            continue
+        # Do not persist meta/progress phrasing as concept knowledge.
+        if kind in {"mentioned", "observation"} and is_meta:
+            continue
+        # Chat intent should only persist stronger signals.
+        if intent == "chat" and kind in {"mentioned", "observation", "asked"} and delta < 0.1:
+            continue
+
+        key = (topic, concept_id)
+        prev = by_key.get(key)
+        if not isinstance(prev, dict):
+            by_key[key] = row
+            continue
+
+        prev_delta = abs(float(prev.get("proficiency_delta", 0.0)))
+        if delta > prev_delta:
+            by_key[key] = row
+
+    return list(by_key.values())[:8]
 
 
 def _is_specific_goal_concept(concept_id: str) -> bool:
@@ -1528,10 +1742,11 @@ def _is_generic_gate_candidate(planned: Dict[str, Any]) -> bool:
 
 
 def _topic_exists(model: Dict[str, Any], topic: str) -> bool:
-    topic_name = (topic or "").strip()
+    topic_name = canonicalize_topic_label(topic or "")
     if not topic_name:
         return False
-    topics = model.get("topics")
+    safe = ensure_model_shape(model)
+    topics = safe.get("topics")
     return isinstance(topics, dict) and topic_name in topics
 
 
@@ -1594,6 +1809,7 @@ def _pedagogical_plan_with_reasoning(
     target_topic = str(data.get("target_topic") or "").strip()
     if not target_topic:
         target_topic = str(route.get("target_topic") or "").strip() or current_topic or "General"
+    target_topic = canonicalize_topic_label(target_topic)
 
     target_concept = str(data.get("target_concept") or "").strip()
     misconception = str(data.get("misconception") or "").strip()
@@ -1964,6 +2180,8 @@ def _route_turn_with_reasoning(
         confidence = max(confidence, 0.75)
     if intent in {"learn_request", "pending_switch"} and not target_topic:
         target_topic = inferred_topic
+    if target_topic:
+        target_topic = canonicalize_topic_label(target_topic)
 
     return {
         "intent": intent,
@@ -2184,9 +2402,9 @@ def respond_turn(state: TutorState) -> Dict[str, Any]:
                 student_text=student_text,
                 reason=str(route.get("reason") or "student switched topic"),
             )
-        current_topic = state.get("current_topic", "")
+        current_topic = canonicalize_topic_label(state.get("current_topic") or "General")
         if target_topic:
-            current_topic = target_topic
+            current_topic = canonicalize_topic_label(target_topic)
         out = _run_learning_flow({**state, "current_topic": current_topic, "student_model": model}, model)
         out["student_model"] = ensure_model_shape(out.get("student_model") or model)
         out["response_mode"] = intent
@@ -2199,9 +2417,9 @@ def respond_turn(state: TutorState) -> Dict[str, Any]:
         return out
 
     if intent == "learn_request":
-        current_topic = state.get("current_topic", "")
+        current_topic = canonicalize_topic_label(state.get("current_topic") or "General")
         if target_topic:
-            current_topic = target_topic
+            current_topic = canonicalize_topic_label(target_topic)
         out = _run_learning_flow({**state, "current_topic": current_topic, "student_model": model}, model)
         out["student_model"] = ensure_model_shape(out.get("student_model") or model)
         out["response_mode"] = intent
@@ -2391,7 +2609,7 @@ def plan_next_step(state: TutorState) -> Dict[str, Any]:
                 "next": "ask_prereq_diagnostic",
                 "planned_review_target": planned,
                 "planned_goal_concept": goal_concept,
-                "current_topic": current_topic or str(planned.get("topic") or "General"),
+                "current_topic": canonicalize_topic_label(current_topic or str(planned.get("topic") or "General")),
                 "action_reason": reason or "planner found likely prerequisite gap",
             }
 
@@ -2427,11 +2645,11 @@ def greet(state: TutorState) -> Dict[str, Any]:
 
 def progress_report(state: TutorState) -> Dict[str, Any]:
     model = ensure_model_shape(state.get("student_model") or {})
-    current_topic = state.get("current_topic", "")
     student_text = (state.get("student_answer") or "").strip()
+    scoped_topic = _extract_progress_scope_topic(student_text, model)
 
-    topic_part = model_snapshot(model, current_topic=current_topic or "General")
-    review_part = review_snapshot(model, current_topic=current_topic, limit=5)
+    topic_part = model_snapshot(model, current_topic=scoped_topic)
+    review_part = review_snapshot(model, current_topic=scoped_topic, limit=5)
     msg = f"{topic_part}\n\n{review_part}"
 
     return {
@@ -2449,7 +2667,7 @@ def ask_prereq_diagnostic(state: TutorState) -> Dict[str, Any]:
     concept_id = str(planned.get("concept_id") or "concept").strip() or "concept"
     label = str(planned.get("label") or concept_id).strip() or concept_id
     goal_concept = str(planned.get("goal_concept") or state.get("planned_goal_concept") or "").strip()
-    topic = str(planned.get("topic") or state.get("current_topic") or "General").strip() or "General"
+    topic = canonicalize_topic_label(str(planned.get("topic") or state.get("current_topic") or "General"))
     question = str(planned.get("question") or "").strip()
     if not question:
         question = f"Before we dive deeper, quick check: can you explain {label} in your own words?"
@@ -2528,7 +2746,7 @@ def teach_foundation(state: TutorState) -> Dict[str, Any]:
 
     label = str(active_review.get("label") or active_review.get("concept_id") or "this concept")
     goal_concept = str(active_review.get("goal_concept") or "your target topic").replace("_", " ")
-    foundation_topic = str(active_review.get("topic") or state.get("current_topic") or "General").strip() or "General"
+    foundation_topic = canonicalize_topic_label(str(active_review.get("topic") or state.get("current_topic") or "General"))
     prompt = FOUNDATION_TEACH_PROMPT.format(
         concept_label=label,
         goal_concept=goal_concept,
@@ -2694,7 +2912,7 @@ def ask_review_question(state: TutorState) -> Dict[str, Any]:
             "student_model": model,
         }
 
-    topic = str(target.get("topic") or current_topic or "General")
+    topic = canonicalize_topic_label(str(target.get("topic") or current_topic or "General"))
     concept_id = str(target.get("concept_id") or "concept")
     label = str(target.get("label") or concept_id)
     proficiency = _clamp01(target.get("proficiency", _concept_proficiency(model, topic, concept_id)))
@@ -2771,7 +2989,7 @@ def grade_review_answer(state: TutorState) -> Dict[str, Any]:
             "concept_updates": [],
         }
 
-    topic = str(active_review.get("topic") or state.get("current_topic") or "General")
+    topic = canonicalize_topic_label(str(active_review.get("topic") or state.get("current_topic") or "General"))
     concept_id = str(active_review.get("concept_id") or "concept")
     label = str(active_review.get("label") or concept_id)
     question = str(active_review.get("question") or "")
@@ -2919,6 +3137,10 @@ def chat(state: TutorState) -> Dict[str, Any]:
 def observe_learning(state: TutorState) -> Dict[str, Any]:
     model = ensure_model_shape(state.get("student_model") or {})
     current_topic = state.get("current_topic", "")
+    route = state.get("route")
+    if not isinstance(route, dict):
+        route = {}
+    route_intent = str(route.get("intent") or "chat")
     consumed_student_text = (state.get("consumed_student_text") or "").strip()
     messages = state.get("messages") or []
     last_user, last_ai = _last_user_and_ai(messages)
@@ -3006,12 +3228,15 @@ def observe_learning(state: TutorState) -> Dict[str, Any]:
 
     concept_updates = [*existing_updates, *observed_updates]
     student_turn_text = last_user if isinstance(last_user, str) else ""
-    llm_extracted = _extract_llm_concept_updates(
-        model=model,
-        student_text=student_turn_text,
-        current_topic=new_topic,
-        existing_updates=concept_updates,
-    )
+    allow_llm_extracted = route_intent in {"learn_request", "pending_switch", "review_request", "pending_answer"}
+    llm_extracted: List[Dict[str, Any]] = []
+    if allow_llm_extracted:
+        llm_extracted = _extract_llm_concept_updates(
+            model=model,
+            student_text=student_turn_text,
+            current_topic=new_topic,
+            existing_updates=concept_updates,
+        )
     concept_updates.extend(llm_extracted)
 
     sanitized_updates: List[Dict[str, Any]] = []
@@ -3037,13 +3262,14 @@ def observe_learning(state: TutorState) -> Dict[str, Any]:
 
 def assess_understanding(state: TutorState) -> Dict[str, Any]:
     model = ensure_model_shape(state.get("student_model") or {})
-    current_topic = state.get("current_topic", "")
+    current_topic = canonicalize_topic_label(state.get("current_topic") or "General")
     consumed_student_text = (state.get("consumed_student_text") or "").strip()
     route = state.get("route")
     if not isinstance(route, dict):
         route = {}
     route_intent = str(route.get("intent") or "chat")
-    route_topic = str(route.get("target_topic") or "").strip()
+    route_topic_raw = str(route.get("target_topic") or "").strip()
+    route_topic = canonicalize_topic_label(route_topic_raw) if route_topic_raw else ""
     pedagogical_plan = state.get("pedagogical_plan")
     if not isinstance(pedagogical_plan, dict):
         pedagogical_plan = {}
@@ -3057,15 +3283,41 @@ def assess_understanding(state: TutorState) -> Dict[str, Any]:
 
     if not consumed_student_text:
         return {
+            "current_topic": current_topic,
             "concept_updates": existing_updates,
             "tutor_hint": "",
             "understanding_assessment": {},
+        }
+
+    no_learning_intents = {"session_start", "progress", "pending_social", "pending_defer"}
+    if route_intent in no_learning_intents:
+        return {
+            "current_topic": current_topic,
+            "concept_updates": existing_updates,
+            "tutor_hint": "",
+            "understanding_assessment": {
+                "understanding": "unknown",
+                "misconception": "",
+                "topic": current_topic,
+            },
+        }
+    if route_intent == "chat" and _is_social_message(consumed_student_text) and not _has_explicit_task_intent(consumed_student_text):
+        return {
+            "current_topic": current_topic,
+            "concept_updates": existing_updates,
+            "tutor_hint": "",
+            "understanding_assessment": {
+                "understanding": "unknown",
+                "misconception": "",
+                "topic": current_topic,
+            },
         }
 
     messages = state.get("messages") or []
     last_user, last_ai = _last_user_and_ai(messages)
     if not last_user and not last_ai:
         return {
+            "current_topic": current_topic,
             "concept_updates": existing_updates,
             "tutor_hint": "",
             "understanding_assessment": {},
@@ -3104,7 +3356,8 @@ def assess_understanding(state: TutorState) -> Dict[str, Any]:
     if len(tutor_hint) > 500:
         tutor_hint = tutor_hint[:500].rstrip()
 
-    candidate_topic = str(data.get("topic") or "").strip()
+    candidate_topic_raw = str(data.get("topic") or "").strip()
+    candidate_topic = canonicalize_topic_label(candidate_topic_raw) if candidate_topic_raw else ""
     if route_topic:
         new_topic = route_topic
     elif candidate_topic and route_intent in {"learn_request", "pending_switch"}:
@@ -3121,9 +3374,17 @@ def assess_understanding(state: TutorState) -> Dict[str, Any]:
             if not isinstance(item, dict):
                 continue
             row = dict(item)
-            row_topic = str(row.get("topic") or new_topic).strip() or new_topic
+            row_topic_raw = str(row.get("topic") or "").strip()
+            row_topic = canonicalize_topic_label(row_topic_raw) if row_topic_raw else new_topic
             if not row_topic:
                 continue
+            if row_topic != new_topic:
+                keep_row_topic = (
+                    route_intent in {"review_request", "pending_answer"}
+                    and _topic_exists(model, row_topic)
+                )
+                if not keep_row_topic:
+                    row_topic = new_topic
             row["topic"] = row_topic
             row["proficiency_delta"] = _fallback_delta_for_update(row)
             observed_updates.append(row)
@@ -3169,10 +3430,17 @@ def assess_understanding(state: TutorState) -> Dict[str, Any]:
         if len(sanitized_updates) >= 8:
             break
 
+    filtered_updates = _filter_concept_updates_for_persistence(
+        model=model,
+        updates=sanitized_updates,
+        route_intent=route_intent,
+        default_topic=new_topic,
+    )
+
     return {
         "current_topic": new_topic,
         "tutor_hint": tutor_hint,
-        "concept_updates": sanitized_updates,
+        "concept_updates": filtered_updates,
         "understanding_assessment": {
             "understanding": understanding,
             "misconception": misconception,
@@ -3186,10 +3454,20 @@ def update_student_model(state: TutorState, config: Dict[str, Any] | None = None
     thread_id = configurable.get("thread_id") or "default"
 
     model = ensure_model_shape(state.get("student_model") or {})
-    topic = (state.get("current_topic") or "General").strip() or "General"
+    topic = canonicalize_topic_label(state.get("current_topic") or "General")
     model.setdefault("active_review", {})
     model.setdefault("meta", {"turn_count": 0})
-    concept_updates = state.get("concept_updates") or []
+    raw_updates = state.get("concept_updates") or []
+    route = state.get("route")
+    if not isinstance(route, dict):
+        route = {}
+    route_intent = str(route.get("intent") or "")
+    concept_updates = _filter_concept_updates_for_persistence(
+        model=model,
+        updates=raw_updates if isinstance(raw_updates, list) else [],
+        route_intent=route_intent,
+        default_topic=topic,
+    )
 
     if isinstance(concept_updates, list) and concept_updates:
         model = _merge_concept_updates(model=model, updates=concept_updates, current_topic=topic)
@@ -3198,7 +3476,7 @@ def update_student_model(state: TutorState, config: Dict[str, Any] | None = None
     if isinstance(review_result, dict) and review_result:
         concept_id = str(review_result.get("concept_id") or "concept")
         label = str(review_result.get("label") or concept_id)
-        result_topic = str(review_result.get("topic") or topic)
+        result_topic = canonicalize_topic_label(str(review_result.get("topic") or topic))
         quality = int(review_result.get("quality", 3))
         prof = _concept_proficiency(model, result_topic, concept_id)
         model = update_review_queue(
@@ -3213,7 +3491,7 @@ def update_student_model(state: TutorState, config: Dict[str, Any] | None = None
         for update in concept_updates:
             if not isinstance(update, dict):
                 continue
-            update_topic = str(update.get("topic") or topic).strip() or topic
+            update_topic = canonicalize_topic_label(str(update.get("topic") or topic))
             concept_id = str(update.get("concept_id") or "")
             label = str(update.get("label") or concept_id or "")
             if not concept_id or not label:

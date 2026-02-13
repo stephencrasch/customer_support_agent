@@ -302,6 +302,193 @@ def test_assess_understanding_does_not_drift_topic_on_progress() -> None:
     assert out.get("current_topic") == "Large Language Models", out
 
 
+def test_assess_understanding_ignores_progress_concept_writes() -> None:
+    model = ensure_model_shape(default_student_model())
+    state = {
+        "student_model": model,
+        "current_topic": "Self Attention",
+        "consumed_student_text": "what does my student model look like now",
+        "messages": tutor_agent._append_turn_messages(
+            "what does my student model look like now",
+            "CROSS-TOPIC STRUGGLING ...",
+        ),
+        "route": {"intent": "progress", "target_topic": ""},
+        "pedagogical_plan": {"plan_mode": "direct_answer"},
+        "concept_updates": [],
+    }
+    with _patched_llm(
+        [
+            json.dumps(
+                {
+                    "understanding": "partial",
+                    "misconception": "fake",
+                    "topic": "Knowledge Graphs",
+                    "tutor_hint": "fake hint",
+                    "concept_updates": [
+                        {
+                            "topic": "Knowledge Graphs",
+                            "concept_id": "knowledge_graph",
+                            "label": "Knowledge Graph",
+                            "proficiency_delta": 0.2,
+                            "evidence": {"kind": "mentioned", "text": "fake", "source": "student"},
+                        }
+                    ],
+                }
+            )
+        ]
+    ):
+        out = tutor_agent.assess_understanding(state)
+    assert out.get("current_topic") == "Self Attention", out
+    assert out.get("concept_updates") == [], out
+
+
+def test_progress_report_defaults_to_cross_topic() -> None:
+    model = ensure_model_shape(default_student_model())
+    model = tutor_agent._merge_concept_updates(
+        model=model,
+        updates=[
+            {"topic": "Self Attention", "concept_id": "self_attention", "label": "Self Attention", "proficiency_delta": 0.12},
+            {"topic": "Knowledge Graphs", "concept_id": "knowledge_graph", "label": "Knowledge Graph", "proficiency_delta": 0.08},
+        ],
+        current_topic="General",
+    )
+    state = {
+        "student_model": model,
+        "current_topic": "Self Attention",
+        "student_answer": "show my progress",
+    }
+    out = tutor_agent.progress_report(state)
+    messages = out.get("messages") or []
+    last = messages[-1].content if messages else ""
+    assert "CROSS-TOPIC" in last, last
+    assert "Self Attention" in last and "Knowledge Graphs" in last, last
+
+
+def test_assessment_reanchors_unknown_update_topics_to_target_topic() -> None:
+    model = ensure_model_shape(default_student_model())
+    state = {
+        "student_model": model,
+        "current_topic": "Self Attention",
+        "consumed_student_text": "I am confused about self-attention and pooling",
+        "messages": tutor_agent._append_turn_messages(
+            "I am confused about self-attention and pooling",
+            "Let's separate core attention from pooling.",
+        ),
+        "route": {"intent": "learn_request", "target_topic": "Self Attention"},
+        "pedagogical_plan": {"plan_mode": "explain_then_probe"},
+        "concept_updates": [],
+    }
+    with _patched_llm(
+        [
+            json.dumps(
+                {
+                    "understanding": "partial",
+                    "misconception": "pooling is inside core self-attention",
+                    "topic": "Self Attention",
+                    "tutor_hint": "keep it concrete",
+                    "concept_updates": [
+                        {
+                            "topic": "Self Attention Mechanism",
+                            "concept_id": "mean_max_pooling",
+                            "label": "mean/max pooling",
+                            "proficiency_delta": 0.06,
+                            "evidence": {"kind": "mentioned", "text": "mean/max pooling", "source": "student"},
+                        }
+                    ],
+                }
+            )
+        ]
+    ):
+        out = tutor_agent.assess_understanding(state)
+
+    updates = out.get("concept_updates") or []
+    assert updates, out
+    assert all(str(item.get("topic")) == "Self Attention" for item in updates if isinstance(item, dict)), updates
+
+
+def test_filter_maps_near_duplicate_concept_to_existing() -> None:
+    model = ensure_model_shape(default_student_model())
+    model = tutor_agent._merge_concept_updates(
+        model=model,
+        updates=[
+            {
+                "topic": "Self Attention",
+                "concept_id": "self_attention",
+                "label": "Self-Attention",
+                "proficiency_delta": 0.12,
+                "evidence": {"kind": "introduced", "text": "seed", "source": "tutor"},
+            }
+        ],
+        current_topic="Self Attention",
+    )
+    filtered = tutor_agent._filter_concept_updates_for_persistence(
+        model=model,
+        updates=[
+            {
+                "topic": "Self Attention",
+                "concept_id": "self_attention_mechanism",
+                "label": "Self Attention Mechanism",
+                "proficiency_delta": 0.04,
+                "evidence": {"kind": "mentioned", "text": "mention", "source": "student"},
+            }
+        ],
+        route_intent="learn_request",
+        default_topic="Self Attention",
+    )
+    assert filtered, filtered
+    assert filtered[0].get("concept_id") == "self_attention", filtered
+    assert str(filtered[0].get("label", "")).lower().startswith("self-attention"), filtered
+
+
+def test_update_student_model_merges_near_duplicate_updates() -> None:
+    model = ensure_model_shape(default_student_model())
+    model = tutor_agent._merge_concept_updates(
+        model=model,
+        updates=[
+            {
+                "topic": "Self Attention",
+                "concept_id": "self_attention",
+                "label": "Self-Attention",
+                "proficiency_delta": 0.1,
+                "evidence": {"kind": "introduced", "text": "seed", "source": "tutor"},
+            }
+        ],
+        current_topic="Self Attention",
+    )
+    state = {
+        "student_model": model,
+        "current_topic": "Self Attention",
+        "concept_updates": [
+            {
+                "topic": "Self Attention",
+                "concept_id": "self_attention_mechanism",
+                "label": "Self Attention Mechanism",
+                "proficiency_delta": 0.04,
+                "evidence": {"kind": "mentioned", "text": "student mention", "source": "student"},
+            }
+        ],
+        "review_result": {},
+        "consumed_student_text": "I think I get self-attention mechanism",
+        "messages": [],
+        "route": {
+            "intent": "learn_request",
+            "reason": "student asked to learn topic",
+            "confidence": 0.9,
+            "pause_pending": False,
+        },
+        "action_reason": "student asked to learn topic",
+    }
+    with _patched_store_save():
+        out = tutor_agent.update_student_model(state, config={"configurable": {"thread_id": "test_router_v2"}})
+
+    updated = ensure_model_shape(out.get("student_model") or {})
+    topics = updated.get("topics", {})
+    topic_data = topics.get("Self Attention", {})
+    concepts = topic_data.get("concepts", {}) if isinstance(topic_data, dict) else {}
+    assert "self_attention" in concepts, concepts
+    assert "self_attention_mechanism" not in concepts, concepts
+
+
 def main() -> None:
     tests = [
         test_route_turn_pending_social,
@@ -316,6 +503,11 @@ def main() -> None:
         test_plan_next_step_fresh_topic_prefers_explain_over_gate,
         test_pedagogical_plan_confusion_prefers_explain_then_probe,
         test_assess_understanding_does_not_drift_topic_on_progress,
+        test_assess_understanding_ignores_progress_concept_writes,
+        test_progress_report_defaults_to_cross_topic,
+        test_assessment_reanchors_unknown_update_topics_to_target_topic,
+        test_filter_maps_near_duplicate_concept_to_existing,
+        test_update_student_model_merges_near_duplicate_updates,
     ]
     for test_fn in tests:
         test_fn()

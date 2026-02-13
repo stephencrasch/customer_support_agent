@@ -21,6 +21,7 @@ from typing import Any
 
 
 _STORE_PATH = os.path.join(os.path.dirname(__file__), "student_store.json")
+_TOPIC_ACRONYMS = {"llm", "llms", "nlp", "rnn", "rnns", "lstm", "lstms", "gpt", "cnn", "cnns", "api", "apis"}
 
 
 def _utc_now_iso() -> str:
@@ -58,6 +59,41 @@ def _write_all(data: dict[str, Any]) -> None:
     os.replace(tmp, _STORE_PATH)
 
 
+def _topic_norm_key(topic: str) -> str:
+    cleaned = " ".join(str(topic or "").replace("_", " ").replace("-", " ").split()).strip().lower()
+    if not cleaned:
+        return ""
+    return "".join(ch for ch in cleaned if ch.isalnum())
+
+
+def canonicalize_topic_label(topic: str) -> str:
+    cleaned = " ".join(str(topic or "").replace("_", " ").replace("-", " ").split()).strip()
+    if not cleaned:
+        return "General"
+
+    words: list[str] = []
+    for token in cleaned.split():
+        lower = token.lower()
+        if lower in _TOPIC_ACRONYMS:
+            words.append(lower.upper())
+        elif token.isupper() and len(token) <= 5:
+            words.append(token)
+        else:
+            words.append(token.capitalize())
+    return " ".join(words) or "General"
+
+
+def _canonical_topic_for_model(topic: str, topics: dict[str, Any]) -> str:
+    wanted = _topic_norm_key(topic)
+    if not wanted:
+        return "General"
+    if isinstance(topics, dict):
+        for existing in topics.keys():
+            if _topic_norm_key(str(existing)) == wanted:
+                return str(existing)
+    return canonicalize_topic_label(topic)
+
+
 def default_student_model() -> dict[str, Any]:
     """Create a fresh multi-topic student model."""
     return {
@@ -78,7 +114,52 @@ def ensure_model_shape(model: dict[str, Any] | None) -> dict[str, Any]:
     topics = safe.get("topics")
     if not isinstance(topics, dict):
         topics = {}
-    safe["topics"] = topics
+    merged_topics: dict[str, Any] = {}
+    for raw_topic, raw_topic_data in topics.items():
+        if not isinstance(raw_topic_data, dict):
+            continue
+        topic_name = _canonical_topic_for_model(str(raw_topic), merged_topics)
+        incoming = dict(raw_topic_data)
+        incoming_concepts = incoming.get("concepts")
+        if not isinstance(incoming_concepts, dict):
+            incoming_concepts = {}
+        incoming["concepts"] = incoming_concepts
+
+        if topic_name not in merged_topics:
+            merged_topics[topic_name] = incoming
+            continue
+
+        existing = merged_topics.get(topic_name)
+        if not isinstance(existing, dict):
+            existing = {"concepts": {}, "last_studied": None, "total_practice": 0}
+
+        existing_concepts = existing.get("concepts")
+        if not isinstance(existing_concepts, dict):
+            existing_concepts = {}
+        for concept_id, meta in incoming_concepts.items():
+            if not isinstance(concept_id, str) or not isinstance(meta, dict):
+                continue
+            if concept_id not in existing_concepts:
+                existing_concepts[concept_id] = meta
+        existing["concepts"] = existing_concepts
+
+        existing_studied = _parse_iso(existing.get("last_studied"))
+        incoming_studied = _parse_iso(incoming.get("last_studied"))
+        if incoming_studied and (existing_studied is None or incoming_studied > existing_studied):
+            existing["last_studied"] = incoming_studied.isoformat(timespec="seconds")
+
+        try:
+            existing_total = int(existing.get("total_practice", 0))
+        except (TypeError, ValueError):
+            existing_total = 0
+        try:
+            incoming_total = int(incoming.get("total_practice", 0))
+        except (TypeError, ValueError):
+            incoming_total = 0
+        existing["total_practice"] = max(0, existing_total + incoming_total)
+        merged_topics[topic_name] = existing
+
+    safe["topics"] = merged_topics
 
     turn_log = safe.get("turn_log")
     if not isinstance(turn_log, list):
@@ -88,12 +169,34 @@ def ensure_model_shape(model: dict[str, Any] | None) -> dict[str, Any]:
     review_queue = safe.get("review_queue")
     if not isinstance(review_queue, list):
         review_queue = []
-    safe["review_queue"] = review_queue
+    normalized_queue: dict[tuple[str, str], dict[str, Any]] = {}
+    for raw in review_queue:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        topic_name = _canonical_topic_for_model(str(row.get("topic") or "General"), safe["topics"])
+        concept_id = str(row.get("concept_id") or "").strip()
+        if not concept_id:
+            continue
+        row["topic"] = topic_name
+        row["concept_id"] = concept_id
+        key = (topic_name, concept_id)
+        existing = normalized_queue.get(key)
+        if not isinstance(existing, dict):
+            normalized_queue[key] = row
+            continue
+
+        existing_reviewed = _parse_iso(existing.get("last_reviewed"))
+        row_reviewed = _parse_iso(row.get("last_reviewed"))
+        if row_reviewed and (existing_reviewed is None or row_reviewed >= existing_reviewed):
+            normalized_queue[key] = row
+    safe["review_queue"] = list(normalized_queue.values())
 
     active_review = safe.get("active_review")
     if not isinstance(active_review, dict):
         active_review = {}
     if active_review:
+        active_review["topic"] = _canonical_topic_for_model(str(active_review.get("topic") or "General"), safe["topics"])
         status = active_review.get("status")
         if status not in {"awaiting_answer", "paused", "completed"}:
             awaiting = bool(active_review.get("awaiting_answer"))
@@ -110,6 +213,7 @@ def ensure_model_shape(model: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(item, dict):
             continue
         row = dict(item)
+        row["topic"] = _canonical_topic_for_model(str(row.get("topic") or "General"), safe["topics"])
         row["status"] = "paused"
         row["awaiting_answer"] = False
         normalized_paused.append(row)
@@ -158,7 +262,8 @@ def get_due_reviews(
     """Return due review items sorted by due time then weakest proficiency."""
     safe = ensure_model_shape(model)
     now_dt = _parse_iso(now_iso) or datetime.now(timezone.utc)
-    topic_filter = (current_topic or "").strip().lower()
+    topic_scope = _canonical_topic_for_model(current_topic, safe.get("topics", {})) if current_topic else ""
+    topic_filter = topic_scope.lower() if topic_scope else ""
 
     due_items: list[dict[str, Any]] = []
     for raw in safe.get("review_queue", []):
@@ -206,7 +311,7 @@ def update_review_queue(
     queue = safe.get("review_queue", [])
     now_dt = _parse_iso(now_iso) or datetime.now(timezone.utc)
 
-    topic_norm = (topic or "General").strip() or "General"
+    topic_norm = _canonical_topic_for_model(topic or "General", safe.get("topics", {}))
     concept_norm = (concept_id or "concept").strip() or "concept"
     label_norm = (label or concept_norm).strip() or concept_norm
     quality = max(0, min(5, int(quality)))
@@ -300,7 +405,8 @@ def review_snapshot(
         return "Review queue: no items yet."
 
     now_dt = _parse_iso(now_iso) or datetime.now(timezone.utc)
-    topic_filter = (current_topic or "").strip().lower()
+    topic_scope = _canonical_topic_for_model(current_topic, safe.get("topics", {})) if current_topic else ""
+    topic_filter = topic_scope.lower() if topic_scope else ""
     filtered = []
     for item in queue:
         if topic_filter:
@@ -326,7 +432,7 @@ def review_snapshot(
     )
 
     if not due:
-        scope = current_topic if current_topic and current_topic != "General" else "all topics"
+        scope = topic_scope if topic_scope and topic_scope != "General" else "all topics"
         return f"Review queue ({scope}): {due_count}/{total} due now. No due cards in top {limit}."
 
     lines = []
@@ -336,7 +442,7 @@ def review_snapshot(
         days = item.get("interval_days", 1)
         lines.append(f"{label} [{topic}] (interval {days}d)")
 
-    scope = current_topic if current_topic and current_topic != "General" else "all topics"
+    scope = topic_scope if topic_scope and topic_scope != "General" else "all topics"
     return (
         f"Review queue ({scope}): {due_count}/{total} due now.\n"
         f"Due next: {', '.join(lines)}"
@@ -357,15 +463,17 @@ def model_snapshot(
         max_concepts: Max concepts to show per category
     """
 
-    topics = model.get("topics", {})
+    safe_model = ensure_model_shape(model)
+    topics = safe_model.get("topics", {})
+    scoped_topic = _canonical_topic_for_model(current_topic, topics) if current_topic else ""
     
     # If specific topic requested and exists
-    if current_topic and current_topic != "General" and current_topic in topics:
-        topic_data = topics.get(current_topic, {})
+    if scoped_topic and scoped_topic != "General" and scoped_topic in topics:
+        topic_data = topics.get(scoped_topic, {})
         concepts = topic_data.get("concepts", {})
         
         if not isinstance(concepts, dict) or not concepts:
-            return f"Topic '{current_topic}': No concepts learned yet"
+            return f"Topic '{scoped_topic}': No concepts learned yet"
         
         # Group by mastery within this topic
         struggling, developing, proficient = [], [], []
@@ -419,7 +527,7 @@ def model_snapshot(
             )
             parts.append(f"PROFICIENT ({len(proficient)}): {items_str}")
         
-        result = f"Topic: {current_topic}\n" + "\n".join(parts) if parts else f"Topic: {current_topic} (no concepts yet)"
+        result = f"Topic: {scoped_topic}\n" + "\n".join(parts) if parts else f"Topic: {scoped_topic} (no concepts yet)"
         return result
     
     # Cross-topic overview
