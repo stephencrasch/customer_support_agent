@@ -93,11 +93,27 @@ def ensure_model_shape(model: dict[str, Any] | None) -> dict[str, Any]:
     active_review = safe.get("active_review")
     if not isinstance(active_review, dict):
         active_review = {}
+    if active_review:
+        status = active_review.get("status")
+        if status not in {"awaiting_answer", "paused", "completed"}:
+            awaiting = bool(active_review.get("awaiting_answer"))
+            status = "awaiting_answer" if awaiting else "completed"
+        active_review["status"] = status
+        active_review["awaiting_answer"] = status == "awaiting_answer"
     safe["active_review"] = active_review
 
     paused_reviews = safe.get("paused_reviews")
     if not isinstance(paused_reviews, list):
         paused_reviews = []
+    normalized_paused: list[dict[str, Any]] = []
+    for item in paused_reviews:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        row["status"] = "paused"
+        row["awaiting_answer"] = False
+        normalized_paused.append(row)
+    paused_reviews = normalized_paused[-8:]
     safe["paused_reviews"] = paused_reviews
 
     meta = safe.get("meta")

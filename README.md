@@ -28,6 +28,13 @@ Alternate minimal tutor demo:
 python chat_tutor.py
 ```
 
+Router mode toggle (defaults to V2):
+
+```bash
+export TUTOR_ROUTER_V2=true   # new minimal DAG
+export TUTOR_ROUTER_V2=false  # legacy router DAG
+```
+
 ## Local Data (Ignored by Git)
 
 Runtime artifacts are intentionally ignored:

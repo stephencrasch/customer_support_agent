@@ -6,7 +6,7 @@ How it works:
 - We reuse the same `thread_id` across runs (saved in `.tutor_thread_id`) so the
   checkpointer and JSON store keep long-term continuity.
 - Each user input is passed in as `student_answer`.
-- The graph runs router -> chat -> END.
+- The graph runs `load_student_model -> route_turn -> pedagogical_plan -> respond_turn -> assess_understanding -> update_student_model -> END`.
 - We print only the *new* AI messages since the last turn.
 
 Exit commands:
