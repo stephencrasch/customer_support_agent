@@ -63,7 +63,36 @@ def _topic_norm_key(topic: str) -> str:
     cleaned = " ".join(str(topic or "").replace("_", " ").replace("-", " ").split()).strip().lower()
     if not cleaned:
         return ""
-    return "".join(ch for ch in cleaned if ch.isalnum())
+
+    stopwords = {
+        "concept",
+        "concepts",
+        "topic",
+        "topics",
+        "overview",
+        "intro",
+        "introduction",
+        "basics",
+        "basic",
+        "mechanism",
+        "mechanisms",
+    }
+    parts: list[str] = []
+    for token in cleaned.split():
+        part = "".join(ch for ch in token if ch.isalnum())
+        if not part:
+            continue
+        if part.endswith("s") and len(part) > 3:
+            part = part[:-1]
+        if part in stopwords:
+            continue
+        parts.append(part)
+
+    if not parts:
+        parts = ["".join(ch for ch in token if ch.isalnum()) for token in cleaned.split()]
+        parts = [part for part in parts if part]
+
+    return "".join(parts)
 
 
 def canonicalize_topic_label(topic: str) -> str:
@@ -92,6 +121,293 @@ def _canonical_topic_for_model(topic: str, topics: dict[str, Any]) -> str:
             if _topic_norm_key(str(existing)) == wanted:
                 return str(existing)
     return canonicalize_topic_label(topic)
+
+
+def _to_concept_id(value: str) -> str:
+    cleaned = str(value or "").strip().lower()
+    out: list[str] = []
+    prev_sep = False
+    for ch in cleaned:
+        if ch.isalnum():
+            out.append(ch)
+            prev_sep = False
+        elif not prev_sep:
+            out.append("_")
+            prev_sep = True
+    concept_id = "".join(out).strip("_")
+    return concept_id or "concept"
+
+
+def _concept_norm_key(value: str) -> str:
+    cleaned = " ".join(str(value or "").replace("_", " ").replace("-", " ").split()).strip().lower()
+    if not cleaned:
+        return ""
+
+    stopwords = {
+        "concept",
+        "concepts",
+        "mechanism",
+        "mechanisms",
+        "topic",
+        "topics",
+        "overview",
+        "intro",
+        "introduction",
+        "basics",
+        "basic",
+        "theory",
+        "fundamental",
+        "fundamentals",
+    }
+    tokens: list[str] = []
+    for token in cleaned.split():
+        token_clean = "".join(ch for ch in token if ch.isalnum())
+        if not token_clean:
+            continue
+        if token_clean.endswith("s") and len(token_clean) > 3:
+            token_clean = token_clean[:-1]
+        if token_clean in stopwords:
+            continue
+        tokens.append(token_clean)
+    if not tokens:
+        tokens = ["".join(ch for ch in token if ch.isalnum()) for token in cleaned.split()]
+        tokens = [token for token in tokens if token]
+    return " ".join(tokens)
+
+
+def _concept_id_quality(concept_id: str) -> tuple[int, int, int]:
+    parts = [part for part in str(concept_id or "").split("_") if part]
+    stop = {
+        "concept",
+        "mechanism",
+        "topic",
+        "overview",
+        "intro",
+        "introduction",
+        "basics",
+        "basic",
+        "theory",
+        "fundamental",
+    }
+    stop_count = sum(1 for part in parts if part in stop)
+    return (stop_count, len(parts), len(str(concept_id or "")))
+
+
+def _prefer_concept_id(current_id: str, incoming_id: str) -> str:
+    if not current_id:
+        return incoming_id or "concept"
+    if not incoming_id:
+        return current_id
+    current_quality = _concept_id_quality(current_id)
+    incoming_quality = _concept_id_quality(incoming_id)
+    if incoming_quality < current_quality:
+        return incoming_id
+    return current_id
+
+
+def _clamp01(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = 0.0
+    return max(0.0, min(1.0, parsed))
+
+
+def _merge_aliases(*alias_lists: Any) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for raw in alias_lists:
+        if not isinstance(raw, list):
+            continue
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            alias = item.strip()
+            if not alias:
+                continue
+            key = alias.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(alias)
+    return merged
+
+
+def _merge_concept_evidence(existing: Any, incoming: Any, limit: int = 24) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for source in (existing, incoming):
+        if not isinstance(source, list):
+            continue
+        for row in source:
+            if isinstance(row, dict):
+                merged.append(dict(row))
+    if len(merged) <= limit:
+        return merged
+    return merged[-limit:]
+
+
+def _merge_concept_meta(base: dict[str, Any], incoming: dict[str, Any], concept_id: str) -> dict[str, Any]:
+    merged = dict(base)
+    merged.update(incoming)
+
+    base_label = str(base.get("label") or "").strip()
+    incoming_label = str(incoming.get("label") or "").strip()
+    default_label = concept_id.replace("_", " ").title()
+    if not base_label:
+        label = incoming_label or default_label
+    elif not incoming_label:
+        label = base_label
+    else:
+        label = incoming_label if len(incoming_label) > len(base_label) else base_label
+    merged["label"] = label
+
+    base_prof = _clamp01(base.get("proficiency", 0.0))
+    incoming_prof = _clamp01(incoming.get("proficiency", 0.0))
+    merged["proficiency"] = max(base_prof, incoming_prof)
+
+    base_count = 0
+    try:
+        base_count = max(0, int(base.get("practice_count", 0)))
+    except (TypeError, ValueError):
+        base_count = 0
+    incoming_count = 0
+    try:
+        incoming_count = max(0, int(incoming.get("practice_count", 0)))
+    except (TypeError, ValueError):
+        incoming_count = 0
+    merged["practice_count"] = base_count + incoming_count
+
+    base_aliases = base.get("aliases")
+    incoming_aliases = incoming.get("aliases")
+    label_aliases = [name for name in (base_label, incoming_label) if name and name != label]
+    merged["aliases"] = _merge_aliases(
+        base_aliases if isinstance(base_aliases, list) else [],
+        incoming_aliases if isinstance(incoming_aliases, list) else [],
+        label_aliases,
+    )
+
+    base_first_seen = _parse_iso(str(base.get("first_seen") or ""))
+    incoming_first_seen = _parse_iso(str(incoming.get("first_seen") or ""))
+    if base_first_seen and incoming_first_seen:
+        first_seen = min(base_first_seen, incoming_first_seen)
+    else:
+        first_seen = base_first_seen or incoming_first_seen
+    if first_seen:
+        merged["first_seen"] = first_seen.isoformat(timespec="seconds")
+
+    base_last = _parse_iso(str(base.get("last_practiced") or ""))
+    incoming_last = _parse_iso(str(incoming.get("last_practiced") or ""))
+    if base_last and incoming_last:
+        last_practiced = max(base_last, incoming_last)
+    else:
+        last_practiced = base_last or incoming_last
+    if last_practiced:
+        merged["last_practiced"] = last_practiced.isoformat(timespec="seconds")
+
+    merged["evidence"] = _merge_concept_evidence(base.get("evidence"), incoming.get("evidence"))
+
+    notes_candidates = [
+        str(base.get("notes") or "").strip(),
+        str(incoming.get("notes") or "").strip(),
+    ]
+    notes_candidates = [note for note in notes_candidates if note]
+    if notes_candidates:
+        merged["notes"] = max(notes_candidates, key=len)
+
+    if incoming_prof >= base_prof:
+        if isinstance(incoming.get("mastery_level"), str):
+            merged["mastery_level"] = incoming.get("mastery_level")
+        if isinstance(incoming.get("trajectory"), str):
+            merged["trajectory"] = incoming.get("trajectory")
+    else:
+        if isinstance(base.get("mastery_level"), str):
+            merged["mastery_level"] = base.get("mastery_level")
+        if isinstance(base.get("trajectory"), str):
+            merged["trajectory"] = base.get("trajectory")
+
+    return merged
+
+
+def _merge_topic_concepts(raw_concepts: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+    if not isinstance(raw_concepts, dict):
+        return ({}, {})
+
+    merged_concepts: dict[str, dict[str, Any]] = {}
+    key_to_id: dict[str, str] = {}
+    concept_id_map: dict[str, str] = {}
+
+    for raw_id, raw_meta in raw_concepts.items():
+        source_id = str(raw_id or "").strip()
+        if not source_id:
+            continue
+        incoming_meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+        incoming_label = str(incoming_meta.get("label") or "").strip()
+        incoming_id = _to_concept_id(source_id or incoming_label)
+        norm_key = _concept_norm_key(incoming_label or incoming_id)
+
+        canonical_id = key_to_id.get(norm_key) if norm_key else ""
+        if not canonical_id:
+            canonical_id = incoming_id
+        if canonical_id in merged_concepts:
+            preferred = _prefer_concept_id(canonical_id, incoming_id)
+            if preferred != canonical_id:
+                merged_concepts[preferred] = merged_concepts.pop(canonical_id)
+                for key, value in list(key_to_id.items()):
+                    if value == canonical_id:
+                        key_to_id[key] = preferred
+                for key, value in list(concept_id_map.items()):
+                    if value == canonical_id:
+                        concept_id_map[key] = preferred
+                canonical_id = preferred
+
+        existing_meta = merged_concepts.get(canonical_id, {})
+        merged_meta = _merge_concept_meta(existing_meta, incoming_meta, canonical_id)
+        merged_concepts[canonical_id] = merged_meta
+
+        if norm_key:
+            key_to_id[norm_key] = canonical_id
+        concept_id_map[source_id] = canonical_id
+        concept_id_map[_to_concept_id(source_id)] = canonical_id
+        if incoming_label:
+            concept_id_map[_to_concept_id(incoming_label)] = canonical_id
+
+    for canonical_id in list(merged_concepts.keys()):
+        concept_id_map[canonical_id] = canonical_id
+
+    return (merged_concepts, concept_id_map)
+
+
+def _canonical_concept_for_model(
+    *,
+    topic: str,
+    concept_id: str,
+    topics: dict[str, Any],
+    concept_maps: dict[str, dict[str, str]],
+) -> str:
+    source_id = str(concept_id or "").strip()
+    if not source_id:
+        return "concept"
+
+    topic_name = _canonical_topic_for_model(topic, topics)
+    topic_map = concept_maps.get(topic_name, {})
+    direct = topic_map.get(source_id)
+    if isinstance(direct, str) and direct.strip():
+        return direct
+
+    source_norm = _to_concept_id(source_id)
+    mapped = topic_map.get(source_norm)
+    if isinstance(mapped, str) and mapped.strip():
+        return mapped
+
+    topic_data = topics.get(topic_name)
+    if isinstance(topic_data, dict):
+        concepts = topic_data.get("concepts")
+        if isinstance(concepts, dict):
+            if source_id in concepts:
+                return source_id
+            if source_norm in concepts:
+                return source_norm
+    return source_norm or "concept"
 
 
 def default_student_model() -> dict[str, Any]:
@@ -159,6 +475,16 @@ def ensure_model_shape(model: dict[str, Any] | None) -> dict[str, Any]:
         existing["total_practice"] = max(0, existing_total + incoming_total)
         merged_topics[topic_name] = existing
 
+    concept_maps_by_topic: dict[str, dict[str, str]] = {}
+    for topic_name, topic_data in list(merged_topics.items()):
+        if not isinstance(topic_data, dict):
+            continue
+        concepts = topic_data.get("concepts")
+        merged_concepts, concept_map = _merge_topic_concepts(concepts if isinstance(concepts, dict) else {})
+        topic_data["concepts"] = merged_concepts
+        merged_topics[topic_name] = topic_data
+        concept_maps_by_topic[topic_name] = concept_map
+
     safe["topics"] = merged_topics
 
     turn_log = safe.get("turn_log")
@@ -175,11 +501,23 @@ def ensure_model_shape(model: dict[str, Any] | None) -> dict[str, Any]:
             continue
         row = dict(raw)
         topic_name = _canonical_topic_for_model(str(row.get("topic") or "General"), safe["topics"])
-        concept_id = str(row.get("concept_id") or "").strip()
-        if not concept_id:
-            continue
+        concept_id = _canonical_concept_for_model(
+            topic=topic_name,
+            concept_id=str(row.get("concept_id") or ""),
+            topics=safe["topics"],
+            concept_maps=concept_maps_by_topic,
+        )
         row["topic"] = topic_name
         row["concept_id"] = concept_id
+        topic_data = safe["topics"].get(topic_name)
+        if isinstance(topic_data, dict):
+            concepts = topic_data.get("concepts")
+            if isinstance(concepts, dict):
+                concept_meta = concepts.get(concept_id)
+                if isinstance(concept_meta, dict):
+                    canonical_label = str(concept_meta.get("label") or "").strip()
+                    if canonical_label:
+                        row["label"] = canonical_label
         key = (topic_name, concept_id)
         existing = normalized_queue.get(key)
         if not isinstance(existing, dict):
@@ -196,7 +534,24 @@ def ensure_model_shape(model: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(active_review, dict):
         active_review = {}
     if active_review:
-        active_review["topic"] = _canonical_topic_for_model(str(active_review.get("topic") or "General"), safe["topics"])
+        topic_name = _canonical_topic_for_model(str(active_review.get("topic") or "General"), safe["topics"])
+        concept_id = _canonical_concept_for_model(
+            topic=topic_name,
+            concept_id=str(active_review.get("concept_id") or ""),
+            topics=safe["topics"],
+            concept_maps=concept_maps_by_topic,
+        )
+        active_review["topic"] = topic_name
+        active_review["concept_id"] = concept_id
+        topic_data = safe["topics"].get(topic_name)
+        if isinstance(topic_data, dict):
+            concepts = topic_data.get("concepts")
+            if isinstance(concepts, dict):
+                concept_meta = concepts.get(concept_id)
+                if isinstance(concept_meta, dict):
+                    canonical_label = str(concept_meta.get("label") or "").strip()
+                    if canonical_label:
+                        active_review["label"] = canonical_label
         status = active_review.get("status")
         if status not in {"awaiting_answer", "paused", "completed"}:
             awaiting = bool(active_review.get("awaiting_answer"))
@@ -213,7 +568,24 @@ def ensure_model_shape(model: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(item, dict):
             continue
         row = dict(item)
-        row["topic"] = _canonical_topic_for_model(str(row.get("topic") or "General"), safe["topics"])
+        topic_name = _canonical_topic_for_model(str(row.get("topic") or "General"), safe["topics"])
+        concept_id = _canonical_concept_for_model(
+            topic=topic_name,
+            concept_id=str(row.get("concept_id") or ""),
+            topics=safe["topics"],
+            concept_maps=concept_maps_by_topic,
+        )
+        row["topic"] = topic_name
+        row["concept_id"] = concept_id
+        topic_data = safe["topics"].get(topic_name)
+        if isinstance(topic_data, dict):
+            concepts = topic_data.get("concepts")
+            if isinstance(concepts, dict):
+                concept_meta = concepts.get(concept_id)
+                if isinstance(concept_meta, dict):
+                    canonical_label = str(concept_meta.get("label") or "").strip()
+                    if canonical_label:
+                        row["label"] = canonical_label
         row["status"] = "paused"
         row["awaiting_answer"] = False
         normalized_paused.append(row)
@@ -250,6 +622,29 @@ def save_student_model(*, student_id: str, model: dict[str, Any]) -> None:
     model["updated_at"] = _utc_now_iso()
     all_data[student_id] = model
     _write_all(all_data)
+
+
+def migrate_all_student_models() -> dict[str, int]:
+    """One-time normalization pass for all persisted students."""
+    all_data = _read_all()
+    if not isinstance(all_data, dict):
+        return {"total_students": 0, "updated_students": 0}
+
+    normalized: dict[str, Any] = {}
+    total_students = 0
+    updated_students = 0
+    for student_id, raw in all_data.items():
+        total_students += 1
+        source = raw if isinstance(raw, dict) else default_student_model()
+        normalized_model = ensure_model_shape(source)
+        normalized[student_id] = normalized_model
+        if normalized_model != source:
+            updated_students += 1
+
+    if updated_students > 0:
+        _write_all(normalized)
+
+    return {"total_students": total_students, "updated_students": updated_students}
 
 
 def get_due_reviews(

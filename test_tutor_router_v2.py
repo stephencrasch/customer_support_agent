@@ -489,6 +489,96 @@ def test_update_student_model_merges_near_duplicate_updates() -> None:
     assert "self_attention_mechanism" not in concepts, concepts
 
 
+def test_ensure_model_shape_migrates_duplicate_concepts_and_reviews() -> None:
+    raw_model = {
+        "topics": {
+            "Self-Attention": {
+                "concepts": {
+                    "self_attention_mechanism": {
+                        "label": "Self Attention Mechanism",
+                        "proficiency": 0.15,
+                        "practice_count": 1,
+                    },
+                    "self_attention": {
+                        "label": "Self-Attention",
+                        "proficiency": 0.25,
+                        "practice_count": 2,
+                    },
+                }
+            }
+        },
+        "review_queue": [
+            {
+                "topic": "Self Attention",
+                "concept_id": "self_attention_mechanism",
+                "label": "Self Attention Mechanism",
+                "due_at": "2025-01-01T00:00:00+00:00",
+                "interval_days": 1,
+                "proficiency": 0.2,
+            }
+        ],
+        "active_review": {
+            "topic": "self attention",
+            "concept_id": "self_attention_mechanism",
+            "label": "Self Attention Mechanism",
+            "status": "awaiting_answer",
+            "awaiting_answer": True,
+        },
+        "paused_reviews": [
+            {
+                "topic": "SELF ATTENTION",
+                "concept_id": "self_attention_mechanism",
+                "label": "Self Attention Mechanism",
+            }
+        ],
+    }
+    normalized = ensure_model_shape(raw_model)
+    topics = normalized.get("topics", {})
+    topic_data = topics.get("Self Attention", {})
+    concepts = topic_data.get("concepts", {}) if isinstance(topic_data, dict) else {}
+    assert "self_attention" in concepts, concepts
+    assert "self_attention_mechanism" not in concepts, concepts
+
+    queue = normalized.get("review_queue", [])
+    assert queue and queue[0].get("concept_id") == "self_attention", queue
+
+    active_review = normalized.get("active_review", {})
+    assert active_review.get("concept_id") == "self_attention", active_review
+
+    paused = normalized.get("paused_reviews", [])
+    assert paused and paused[0].get("concept_id") == "self_attention", paused
+
+
+def test_ensure_model_shape_merges_topic_alias_with_mechanism_suffix() -> None:
+    raw_model = {
+        "topics": {
+            "Self Attention": {
+                "concepts": {
+                    "self_attention": {
+                        "label": "Self-Attention",
+                        "proficiency": 0.2,
+                    }
+                }
+            },
+            "Self Attention Mechanism": {
+                "concepts": {
+                    "attention_mechanism": {
+                        "label": "Attention Mechanism",
+                        "proficiency": 0.15,
+                    }
+                }
+            },
+        }
+    }
+    normalized = ensure_model_shape(raw_model)
+    topics = normalized.get("topics", {})
+    assert "Self Attention" in topics, topics
+    assert "Self Attention Mechanism" not in topics, topics
+    merged_concepts = topics["Self Attention"].get("concepts", {})
+    assert "self_attention" in merged_concepts, merged_concepts
+    assert "attention_mechanism" in merged_concepts, merged_concepts
+
+
 def main() -> None:
     tests = [
         test_route_turn_pending_social,
@@ -508,6 +598,8 @@ def main() -> None:
         test_assessment_reanchors_unknown_update_topics_to_target_topic,
         test_filter_maps_near_duplicate_concept_to_existing,
         test_update_student_model_merges_near_duplicate_updates,
+        test_ensure_model_shape_migrates_duplicate_concepts_and_reviews,
+        test_ensure_model_shape_merges_topic_alias_with_mechanism_suffix,
     ]
     for test_fn in tests:
         test_fn()
